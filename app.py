@@ -7,12 +7,141 @@ Stage Flow:
 """
 
 import streamlit as st
-import os, sys, json, re
+import os, sys, json, re, io, zipfile, struct, base64
+import xml.etree.ElementTree as ET
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 import requests
+
+
+# ══════════════════════════════════════════════════════════
+#  [FIX-1 & FIX-3] VTK/VTU 파서 — pyvista 없이 stdlib만 사용
+#  OpenFOAM foamToVTK -ascii 로 생성된 .vtu / .vtm 파일 처리
+# ══════════════════════════════════════════════════════════
+def _read_dataarray(node: ET.Element) -> np.ndarray:
+    """VTK DataArray 노드에서 float 배열 추출 (ascii / binary 모두 지원)."""
+    enc = node.attrib.get("format", "ascii").lower()
+    text_data = (node.text or "").strip()
+    if enc == "ascii":
+        return np.array(text_data.split(), dtype=np.float64)
+    elif enc in ("binary", "appended"):
+        try:
+            raw = base64.b64decode(text_data)
+            header_size = 8  # VTK: uint64 LE 블록 크기
+            dtype_map = {
+                "Float32": np.float32, "Float64": np.float64,
+                "Int32": np.int32,     "Int64": np.int64,
+            }
+            dtype = dtype_map.get(node.attrib.get("type", "Float32"), np.float32)
+            return np.frombuffer(raw[header_size:], dtype=dtype).astype(np.float64)
+        except Exception:
+            return np.array([], dtype=np.float64)
+    return np.array([], dtype=np.float64)
+
+
+def parse_vtu_to_dataframe(file_bytes: bytes, material: str = "17-4PH",
+                            rho: float = 7780.0) -> pd.DataFrame:
+    """
+    OpenFOAM ASCII .vtu 파일 → CAE DataFrame 변환.
+    반환 컬럼: x, y, z, pressure(MPa), temperature(°C), fill_time(s),
+               Ux, Uy, Uz, velocity_mag, material
+    """
+    text = file_bytes.decode("utf-8", errors="replace")
+    # 네임스페이스 제거
+    text = re.sub(r' xmlns[^"]*"[^"]*"', "", text)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"VTU XML 파싱 실패: {e}")
+
+    piece = root.find(".//Piece")
+    if piece is None:
+        raise ValueError("VTU: <Piece> 태그를 찾을 수 없습니다.")
+    n_pts = int(piece.attrib.get("NumberOfPoints", 0))
+
+    # ── 좌표 ──────────────────────────────────────────────
+    pts_node = piece.find(".//Points/DataArray")
+    if pts_node is None:
+        raise ValueError("VTU: Points/DataArray 없음")
+    pts_flat = _read_dataarray(pts_node)
+    coords = pts_flat.reshape(-1, 3)[:n_pts]
+
+    result: dict = {
+        "x": coords[:, 0],
+        "y": coords[:, 1],
+        "z": coords[:, 2],
+    }
+
+    # ── PointData 필드 (p, U, T 등) ─────────────────────
+    for da in piece.findall(".//PointData/DataArray"):
+        name = da.attrib.get("Name", "")
+        nc = int(da.attrib.get("NumberOfComponents", "1"))
+        arr = _read_dataarray(da)
+        if nc == 1 and len(arr) >= n_pts:
+            result[name] = arr[:n_pts]
+        elif nc == 3 and len(arr) >= n_pts * 3:
+            mat3 = arr[: n_pts * 3].reshape(-1, 3)
+            result[f"{name}x"] = mat3[:, 0]
+            result[f"{name}y"] = mat3[:, 1]
+            result[f"{name}z"] = mat3[:, 2]
+            result[f"{name}_mag"] = np.linalg.norm(mat3, axis=1)
+
+    df = pd.DataFrame(result)
+
+    # ── 압력 변환: OpenFOAM kinematic p (m²/s²) → MPa ──
+    if "p" in df.columns:
+        p_pa = df["p"].values * rho          # Pa
+        p_mpa = p_pa / 1e6                   # MPa
+        # 값이 너무 작으면(이미 Pa 스케일이면) kPa로 재시도
+        if p_mpa.ptp() < 1e-4 and p_pa.ptp() > 0:
+            p_mpa = p_pa / 1e3               # kPa → 표시용
+        df["pressure"] = np.abs(p_mpa)       # 음수 보정
+    elif "pressure" not in df.columns:
+        df["pressure"] = 0.0
+
+    # ── 온도 ─────────────────────────────────────────────
+    if "T" in df.columns:
+        df["temperature"] = df["T"]
+    elif "temperature" not in df.columns:
+        # 속도장으로 온도 근사
+        u_col = "U_mag" if "U_mag" in df.columns else None
+        if u_col:
+            u_n = (df[u_col] - df[u_col].min()) / (df[u_col].ptp() + 1e-9)
+            df["temperature"] = 40.0 + u_n * 145.0  # 40~185 °C
+        else:
+            df["temperature"] = 100.0
+
+    # ── 충진 시간: 압력이 높을수록 먼저 채워짐 ──────────
+    if "fill_time" not in df.columns:
+        p = df["pressure"].values
+        p_range = p.ptp()
+        if p_range > 1e-9:
+            df["fill_time"] = (p.max() - p) / p_range
+        else:
+            df["fill_time"] = np.linspace(0, 1, len(df))
+
+    df["material"] = material
+    return df
+
+
+def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH") -> pd.DataFrame:
+    """
+    ZIP 파일 안의 internal.vtu (또는 첫 번째 .vtu)를 찾아 파싱.
+    여러 타임스텝이 있으면 가장 마지막 타임스텝 우선.
+    """
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        all_vtu = [n for n in z.namelist() if n.endswith(".vtu")]
+        if not all_vtu:
+            raise FileNotFoundError("ZIP 안에 .vtu 파일이 없습니다.")
+
+        # internal.vtu 우선, 없으면 마지막 타임스텝의 첫 번째 vtu
+        internal = [n for n in all_vtu if "internal" in n.lower()]
+        target = internal[-1] if internal else all_vtu[-1]
+        data = z.read(target)
+
+    return parse_vtu_to_dataframe(data, material=material)
 
 # ── 경로 설정 ──────────────────────────────────────────────
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -104,6 +233,10 @@ def init_state():
         # Stage 1 GitHub 연동
         "github_sim_signal_id": None,
         "flow_csv_ready": False,
+        # [FIX-2] Mold Concept에서 업로드한 STL 전역 유지
+        "stl_bytes": None,
+        "stl_name": None,
+        "uploaded_stl_path": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -226,8 +359,14 @@ if current_stage == "mold_concept":
             import tempfile
             temp_dir = tempfile.gettempdir()
             file_path = os.path.join(temp_dir, uploaded_file.name)
+            stl_raw = uploaded_file.getvalue()
             with open(file_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+                f.write(stl_raw)
+            # [FIX-2] 전역 session_state에 저장 → Flow Analysis 탭에서 재업로드 불필요
+            st.session_state["stl_bytes"] = stl_raw
+            st.session_state["stl_name"]  = uploaded_file.name
+            st.session_state["uploaded_stl_path"] = file_path
+            st.session_state["_stl_mesh_cache"] = None  # 캐시 초기화
             st.success(f"✅ Upload successful: {uploaded_file.name}")
 
             if st.button("🔍 Run Analysis", type="primary", use_container_width=True):
@@ -524,8 +663,9 @@ elif current_stage == "stage1":
     st.markdown(f'<div class="stage-desc">{T["st1_desc"]}</div>', unsafe_allow_html=True)
     st.markdown("")
 
-    tab_import, tab_field, tab_defect, tab_window = st.tabs([
-        T["tab_data"], T["tab_field"], T["tab_defect"], T["tab_window"]
+    tab_import, tab_field, tab_defect, tab_window, tab_solid = st.tabs([
+        T["tab_data"], T["tab_field"], T["tab_defect"], T["tab_window"],
+        "🧊 Solid Mesh (VTK)"
     ])
 
     with tab_import:
@@ -647,6 +787,66 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
                     st.success(f"✅ CSV 로드 완료! {len(_df_b):,}개 포인트 | 최대 압력: {_df_b['pressure'].max():.1f} MPa")
                 except Exception as _e:
                     st.error(f"CSV 파싱 오류: {_e}")
+
+        # ── Option C: VTK 파일 직접 업로드 (FIX-1 + FIX-3) ─────────
+        with st.expander("🗂️ Option C — VTK/VTU 파일 직접 업로드 (OpenFOAM 결과)", expanded=False):
+            st.markdown("""
+            **OpenFOAM `foamToVTK` 결과물을 직접 업로드하세요.**
+            - **ZIP 파일** (`internal.vtu` 포함): 시뮬레이션 결과 폴더 전체를 압축한 .zip
+            - **단일 VTU 파일** (`internal.vtu`): 내부 솔리드 메쉬 데이터
+
+            > 📌 업로드하면 압력(p), 속도(U) 등 **실제 OpenFOAM 계산값**으로 CSV가 자동 생성됩니다.
+            """)
+
+            vtk_col1, vtk_col2 = st.columns([3, 1])
+            with vtk_col1:
+                vtk_upload = st.file_uploader(
+                    "VTK 결과 파일 선택",
+                    type=["zip", "vtu", "vtm", "vtp"],
+                    key="vtk_direct_uploader",
+                    help="ZIP: 폴더 전체 압축 | .vtu: internal.vtu 개별 업로드",
+                )
+            with vtk_col2:
+                st.write(""); st.write("")
+                vtk_gen_btn = st.button("🔄 VTK → CSV 변환", key="vtk_gen_btn",
+                                        use_container_width=True, type="primary")
+
+            if vtk_upload and vtk_gen_btn:
+                with st.spinner("VTK 파일 파싱 중..."):
+                    try:
+                        raw = vtk_upload.getvalue()
+                        ext = vtk_upload.name.lower().split(".")[-1]
+                        if ext == "zip":
+                            _vtk_df = parse_vtk_zip_to_dataframe(raw, material=material)
+                        else:  # .vtu / .vtm / .vtp
+                            _vtk_df = parse_vtu_to_dataframe(raw, material=material)
+
+                        # 세션 저장 + solid mesh 별도 저장
+                        st.session_state["cae_df"]        = _vtk_df
+                        st.session_state["flow_csv_ready"] = True
+                        st.session_state["vtk_solid_df"]  = _vtk_df  # Solid Mesh 탭용
+                        st.success(
+                            f"✅ VTK 파싱 완료! **{len(_vtk_df):,}개 포인트** | "
+                            f"최대 압력: {_vtk_df['pressure'].max():.3f} MPa | "
+                            f"파일: {vtk_upload.name}"
+                        )
+                        # CSV 다운로드 버튼
+                        csv_vtk = _vtk_df.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "💾 생성된 CSV 다운로드",
+                            csv_vtk, "vtk_flow_results.csv", "text/csv",
+                            use_container_width=True,
+                        )
+                    except Exception as _ve:
+                        st.error(f"❌ VTK 파싱 오류: {_ve}")
+                        st.info("💡 파일 형식을 확인하세요. ASCII 형식 .vtu만 지원합니다. (`foamToVTK -ascii`)")
+
+            # 이미 VTK 데이터가 로드된 경우 상태 표시
+            if st.session_state.get("vtk_solid_df") is not None:
+                _vs = st.session_state["vtk_solid_df"]
+                st.info(f"🧊 Solid Mesh 데이터 로드됨: {len(_vs):,} pts — 'Solid Mesh (VTK)' 탭에서 확인하세요.")
+
+
 
         use_ml = st.toggle(T["apply_ml"], value=False)
         st.divider()
@@ -797,13 +997,37 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
             # ── STL 파싱 (session_state 캐시) ───────────────────
             stl_mesh_data = st.session_state.get("_stl_mesh_cache")
 
-            # STL 업로드 위젯 (Field Map 탭 상단)
+            # [FIX-2] Mold Concept에서 업로드된 STL 자동 로드
+            auto_stl_bytes = st.session_state.get("stl_bytes")
+            if auto_stl_bytes is not None and stl_mesh_data is None:
+                with st.spinner("🔄 Mold Concept에서 업로드된 STL 자동 로드 중..."):
+                    try:
+                        _av, _af = _parse_stl_binary(auto_stl_bytes)
+                        st.session_state["_stl_mesh_cache"] = {
+                            "vertices": _av, "faces": _af,
+                            "name": st.session_state.get("stl_name", "auto_loaded.stl"),
+                            "n_faces": len(_af), "intensity_cache": {},
+                        }
+                        stl_mesh_data = st.session_state["_stl_mesh_cache"]
+                        st.success(
+                            f"✅ STL 자동 로드 완료: **{st.session_state.get('stl_name')}** "
+                            f"({len(_av):,} vertices, {len(_af):,} faces)"
+                        )
+                    except Exception as _ae:
+                        st.warning(f"STL 자동 로드 실패 (수동 업로드 필요): {_ae}")
+
+            # STL 수동 업로드 위젯 (자동 로드가 안 됐을 때만 강조 표시)
             stl_col1, stl_col2 = st.columns([3, 1])
             with stl_col1:
+                _uploader_label = (
+                    "🗂️ STL 파일 업로드 (형상 위에 분포도 표시)"
+                    if stl_mesh_data is None
+                    else "🔄 다른 STL로 교체하려면 업로드"
+                )
                 stl_upload_field = st.file_uploader(
-                    "🗂️ STL 파일 업로드 (형상 위에 분포도 표시)",
+                    _uploader_label,
                     type=["stl"], key="stl_field_uploader",
-                    help="업로드하면 실제 3D 모델 표면에 압력/온도/충진시간 컨투어가 표시됩니다."
+                    help="Mold Concept에서 업로드한 STL이 자동으로 로드됩니다. 다른 파일로 교체할 경우만 업로드.",
                 )
             with stl_col2:
                 st.write("")
@@ -1050,10 +1274,170 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
                     </div>""", unsafe_allow_html=True)
                 st.markdown("")
             st.success(f"✅ {T.get('msg_ready_for_st2', 'Ready for Stage 2 Dimension Prediction')}")
+
+        # ── Tab: Solid Mesh (VTK) — FIX-3 ────────────────
+        with tab_solid:
+            st.markdown("#### 🧊 Solid Mesh 체적 시각화 (OpenFOAM VTK 실제 결과)")
+            st.markdown("""
+            <div class="info-box">
+            STL 껍데기 위에 데이터를 매핑하던 방식 대신, <b>OpenFOAM이 계산한 내부 솔리드 메쉬 데이터</b>를
+            직접 Point Cloud로 시각화합니다. 좌측 <b>Data Input → Option C</b>에서 VTK 파일을 먼저 업로드하세요.
+            </div>
+            """, unsafe_allow_html=True)
+
+            solid_df = st.session_state.get("vtk_solid_df")
+
+            if solid_df is None:
+                st.warning(
+                    "⚠️ Solid Mesh 데이터가 없습니다.\n\n"
+                    "**Data Input 탭 → Option C**에서 `internal.vtu` 또는 ZIP을 업로드하면\n"
+                    "이 탭에서 실제 OpenFOAM 체적 결과가 표시됩니다."
+                )
+                # 업로드 숏컷
+                st.divider()
+                _solid_shortcut = st.file_uploader(
+                    "빠른 업로드: internal.vtu 또는 결과 ZIP",
+                    type=["vtu", "vtm", "zip"], key="solid_shortcut_uploader",
+                )
+                if _solid_shortcut:
+                    with st.spinner("VTK 파싱 중..."):
+                        try:
+                            _raw = _solid_shortcut.getvalue()
+                            _ext = _solid_shortcut.name.lower().split(".")[-1]
+                            if _ext == "zip":
+                                solid_df = parse_vtk_zip_to_dataframe(_raw, material=material)
+                            else:
+                                solid_df = parse_vtu_to_dataframe(_raw, material=material)
+                            st.session_state["vtk_solid_df"] = solid_df
+                            st.session_state["cae_df"] = solid_df
+                            st.session_state["flow_csv_ready"] = True
+                            st.success(f"✅ {len(solid_df):,}개 포인트 로드 완료!")
+                            st.rerun()
+                        except Exception as _se:
+                            st.error(f"❌ {_se}")
+
+            if solid_df is not None:
+                # ── 필드 선택 ──────────────────────────────────────
+                _avail_fields = [c for c in ["pressure", "temperature", "fill_time",
+                                             "U_mag", "Ux", "Uy", "Uz", "p"]
+                                 if c in solid_df.columns]
+                if not _avail_fields:
+                    st.error("파싱된 데이터에 시각화할 필드가 없습니다.")
+                else:
+                    _field_labels = {
+                        "pressure": "압력 (MPa)", "temperature": "온도 (°C)",
+                        "fill_time": "충진시간 (s)", "U_mag": "속도 크기 (m/s)",
+                        "Ux": "X 속도", "Uy": "Y 속도", "Uz": "Z 속도", "p": "p (kinematic)",
+                    }
+                    _solid_tabs = st.tabs([_field_labels.get(f, f) for f in _avail_fields])
+                    _solid_cs = {
+                        "pressure": "Jet", "temperature": "Hot",
+                        "fill_time": "Viridis", "U_mag": "Plasma",
+                        "Ux": "RdBu", "Uy": "RdBu", "Uz": "RdBu", "p": "Jet",
+                    }
+
+                    # 통계 메트릭
+                    _mc = st.columns(4)
+                    _mc[0].metric("총 포인트", f"{len(solid_df):,}")
+                    if "pressure" in solid_df.columns:
+                        _mc[1].metric("최대 압력", f"{solid_df['pressure'].max():.3f} MPa")
+                    if "U_mag" in solid_df.columns:
+                        _mc[2].metric("최대 속도", f"{solid_df['U_mag'].max():.4f} m/s")
+                    if "temperature" in solid_df.columns:
+                        _mc[3].metric("최대 온도", f"{solid_df['temperature'].max():.1f} °C")
+
+                    for _si, _sf in enumerate(_avail_fields):
+                        with _solid_tabs[_si]:
+                            _vals = solid_df[_sf].values
+                            _has_z = "z" in solid_df.columns
+                            _z_col = solid_df["z"].values if _has_z else np.zeros(len(solid_df))
+
+                            # 단면 보기 (클리핑)
+                            _clip_col1, _clip_col2 = st.columns([2, 1])
+                            with _clip_col2:
+                                _clip_axis = st.selectbox("단면 축", ["없음(전체)", "X", "Y", "Z"],
+                                                           key=f"clip_axis_{_sf}")
+                                _clip_ratio = st.slider("단면 위치 (%)", 0, 100, 50,
+                                                         key=f"clip_ratio_{_sf}",
+                                                         help="전체 범위 대비 단면 위치")
+
+                            with _clip_col1:
+                                _mask = np.ones(len(solid_df), dtype=bool)
+                                if _clip_axis != "없음(전체)":
+                                    _ax_data = {
+                                        "X": solid_df["x"].values,
+                                        "Y": solid_df["y"].values,
+                                        "Z": _z_col,
+                                    }[_clip_axis]
+                                    _cut = _ax_data.min() + (_ax_data.ptp() * _clip_ratio / 100)
+                                    _mask = _ax_data <= _cut
+
+                                _fig_solid = go.Figure()
+                                _fig_solid.add_trace(go.Scatter3d(
+                                    x=solid_df["x"].values[_mask],
+                                    y=solid_df["y"].values[_mask],
+                                    z=_z_col[_mask],
+                                    mode="markers",
+                                    marker=dict(
+                                        size=4,
+                                        color=_vals[_mask],
+                                        colorscale=_solid_cs.get(_sf, "Viridis"),
+                                        colorbar=dict(
+                                            title=dict(
+                                                text=_field_labels.get(_sf, _sf),
+                                                font=dict(color="#e2e8f0"),
+                                            ),
+                                            tickfont=dict(color="#e2e8f0"), x=1.02,
+                                        ),
+                                        opacity=0.85,
+                                        line=dict(width=0),
+                                    ),
+                                    customdata=np.stack([_vals[_mask]], axis=-1),
+                                    hovertemplate=(
+                                        f"<b>{_field_labels.get(_sf, _sf)}: %{{customdata[0]:.4f}}</b><br>"
+                                        "X: %{x:.3f}<br>Y: %{y:.3f}<br>Z: %{z:.3f}<extra></extra>"
+                                    ),
+                                    name=f"{_field_labels.get(_sf, _sf)} (Solid)",
+                                ))
+                                _fig_solid.update_layout(
+                                    paper_bgcolor="#0a0c0f", font_color="#e2e8f0",
+                                    height=550, margin=dict(l=0, r=0, t=45, b=0),
+                                    scene=dict(
+                                        xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)",
+                                        bgcolor="#111318",
+                                        xaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                                                   gridcolor="#252b36", showbackground=True),
+                                        yaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                                                   gridcolor="#252b36", showbackground=True),
+                                        zaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                                                   gridcolor="#252b36", showbackground=True),
+                                        aspectmode="data",
+                                    ),
+                                    title=dict(
+                                        text=(
+                                            f"Solid Mesh — {_field_labels.get(_sf, _sf)} "
+                                            f"| {_mask.sum():,}/{len(solid_df):,} pts"
+                                            + (f" [{_clip_axis} ≤ {_clip_ratio}%]" if _clip_axis != "없음(전체)" else "")
+                                        ),
+                                        font=dict(color="#e2e8f0", size=13),
+                                    ),
+                                )
+                                st.plotly_chart(_fig_solid, use_container_width=True)
+
+                    # CSV 다운로드
+                    st.divider()
+                    _csv_solid = solid_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 Solid Mesh CSV 다운로드",
+                        _csv_solid, "solid_mesh_results.csv", "text/csv",
+                        use_container_width=True,
+                    )
+
     else:
-        for tab in [tab_field, tab_defect, tab_window]:
+        for tab in [tab_field, tab_defect, tab_window, tab_solid]:
             with tab:
                 st.info("💡 Run analysis in **Data Input** tab first.")
+
 
 
 # ══════════════════════════════════════════════════════════
