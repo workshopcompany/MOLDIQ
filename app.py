@@ -638,20 +638,37 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
             """)
             uploaded = st.file_uploader(T.get("select_cae_file", "CAE CSV 파일 선택"), type=["csv"])
             use_sample = st.checkbox(T["use_sample"], value=False)
+            # ── Option B: CSV 업로드 시 즉시 session_state에 저장 ──
+            if uploaded and not use_sample:
+                try:
+                    _df_b = load_cae_data(uploaded)
+                    st.session_state["cae_df"] = _df_b
+                    st.session_state["flow_csv_ready"] = True
+                    st.success(f"✅ CSV 로드 완료! {len(_df_b):,}개 포인트 | 최대 압력: {_df_b['pressure'].max():.1f} MPa")
+                except Exception as _e:
+                    st.error(f"CSV 파싱 오류: {_e}")
 
         use_ml = st.toggle(T["apply_ml"], value=False)
         st.divider()
+
+        # ── 현재 로드된 데이터 상태 표시 ──────────────────────────
+        if st.session_state.get("flow_csv_ready") and st.session_state.get("cae_df") is not None:
+            _loaded = st.session_state["cae_df"]
+            st.success(f"✅ 데이터 준비됨 — {len(_loaded):,}개 포인트 | 최대 압력: {_loaded['pressure'].max():.1f} MPa")
+        elif not st.session_state.get("flow_csv_ready"):
+            st.info("💡 위에서 Signal ID로 CSV 생성하거나, Option B로 CSV를 업로드한 뒤 분석을 실행하세요.")
 
         if st.button(T["btn_st1"], type="primary", use_container_width=True):
             with st.spinner(T.get("st1_analyzing", "분석 중...")):
                 try:
                     cae_df = st.session_state.get("cae_df")
                     if cae_df is None:
-                        if uploaded and not use_sample:
-                            cae_df = load_cae_data(uploaded)
-                        else:
+                        if use_sample:
                             cae_df = generate_sample_cae_csv(n_points=300, material=material)
                             st.info(f"📌 {T.get('msg_using_sample', '샘플 데이터로 분석합니다.')}")
+                        else:
+                            st.warning("⚠️ 데이터가 없습니다. Signal ID로 CSV를 생성하거나 Option B로 업로드하세요.")
+                            st.stop()
 
                     analysis = analyze_cae(cae_df, material=material)
                     st.session_state["cae_df"]       = cae_df
@@ -685,57 +702,189 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
             colorscales = {"pressure": "Blues", "temperature": "Hot", "fill_time": "Viridis"}
             fields = list(field_options.keys())
 
+            # ── 게이트 위치 절대좌표 앵커링 ─────────────────────────
+            # fill_time이 가장 작은 점 = 게이트 (금속이 처음 도달한 지점)
+            has_z_global = "z" in cae_df.columns
+            gate_row = cae_df.loc[cae_df["fill_time"].idxmin()]
+            gate_x = float(gate_row["x"])
+            gate_y = float(gate_row["y"])
+            gate_z = float(gate_row["z"]) if has_z_global else 0.0
+
+            # ── 상대좌표 계산 (Bounding Box 정규화) ──────────────────
+            x_min, x_max = cae_df["x"].min(), cae_df["x"].max()
+            y_min, y_max = cae_df["y"].min(), cae_df["y"].max()
+            z_min, z_max = (cae_df["z"].min(), cae_df["z"].max()) if has_z_global else (0, 1)
+            x_range = x_max - x_min if x_max != x_min else 1
+            y_range = y_max - y_min if y_max != y_min else 1
+            z_range = z_max - z_min if z_max != z_min else 1
+
+            # 게이트로부터의 거리 (유동 선단 추적용)
+            if has_z_global:
+                cae_df["dist_from_gate"] = np.sqrt(
+                    (cae_df["x"] - gate_x)**2 +
+                    (cae_df["y"] - gate_y)**2 +
+                    (cae_df["z"] - gate_z)**2
+                )
+            else:
+                cae_df["dist_from_gate"] = np.sqrt(
+                    (cae_df["x"] - gate_x)**2 + (cae_df["y"] - gate_y)**2
+                )
+            max_dist = cae_df["dist_from_gate"].max()
+            cae_df["rel_dist"] = cae_df["dist_from_gate"] / max_dist  # 0=게이트, 1=유동선단
+
             for i, ftab in enumerate(field_tabs):
                 ft = fields[i]
                 with ftab:
-                    if ft in cae_df.columns and "x" in cae_df.columns and "y" in cae_df.columns:
-                        has_z = "z" in cae_df.columns
-                        if has_z:
-                            fig3d = go.Figure(data=go.Scatter3d(
-                                x=cae_df["x"], y=cae_df["y"], z=cae_df["z"],
-                                mode="markers",
-                                marker=dict(
-                                    size=3,
-                                    color=cae_df[ft],
-                                    colorscale=colorscales[ft],
-                                    colorbar=dict(title=f"{field_options[ft]}"),
-                                    opacity=0.85,
-                                )
-                            ))
-                            fig3d.update_layout(
-                                scene=dict(
-                                    xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)",
-                                    bgcolor="#111318",
-                                    xaxis=dict(color="#e2e8f0"),
-                                    yaxis=dict(color="#e2e8f0"),
-                                    zaxis=dict(color="#e2e8f0"),
-                                    aspectmode="data",
-                                ),
-                                paper_bgcolor="#0a0c0f", font_color="#e2e8f0",
-                                height=450, margin=dict(l=0, r=0, t=30, b=0),
-                                title=dict(
-                                    text=f"{field_options[ft]} Distribution",
-                                    font=dict(color="#e2e8f0"),
-                                ),
-                            )
-                            st.plotly_chart(fig3d, use_container_width=True)
-                        else:
-                            # 2D heatmap fallback
-                            if analysis["grid_maps"] and ft in analysis["grid_maps"]:
-                                gmap = analysis["grid_maps"][ft]
-                                fig2d = go.Figure(go.Heatmap(
-                                    z=gmap["z"], x=gmap["x"], y=gmap["y"],
-                                    colorscale=colorscales[ft],
-                                    colorbar=dict(title=f"{field_options[ft]}"),
-                                ))
-                                fig2d.update_layout(
-                                    paper_bgcolor="#0a0c0f", plot_bgcolor="#111318",
-                                    font_color="#e2e8f0", height=350,
-                                    margin=dict(l=20, r=20, t=30, b=20),
-                                )
-                                st.plotly_chart(fig2d, use_container_width=True)
-                    else:
+                    if ft not in cae_df.columns or "x" not in cae_df.columns:
                         st.info(f"No '{ft}' column in data.")
+                        continue
+
+                    # ── 3D Volume + Isosurface 시각화 ─────────────────
+                    if has_z_global:
+                        # fill_time 기준 fill progress (충진 순서 애니메이션 레이어)
+                        sorted_df = cae_df.sort_values("fill_time")
+
+                        # Isosurface: 물성값 등가면 (Moldflow처럼 보이게)
+                        # 데이터를 구조화 격자로 보간
+                        from scipy.interpolate import griddata
+                        n_grid = 20
+                        xi = np.linspace(x_min, x_max, n_grid)
+                        yi = np.linspace(y_min, y_max, n_grid)
+                        zi = np.linspace(z_min, z_max, n_grid)
+                        xi3, yi3, zi3 = np.meshgrid(xi, yi, zi, indexing="ij")
+
+                        pts = cae_df[["x", "y", "z"]].values
+                        vals = cae_df[ft].values
+                        vi3 = griddata(pts, vals, (xi3, yi3, zi3), method="linear")
+                        # NaN을 nearest로 채움
+                        vi3_near = griddata(pts, vals, (xi3, yi3, zi3), method="nearest")
+                        mask = np.isnan(vi3)
+                        vi3[mask] = vi3_near[mask]
+
+                        vmin, vmax = float(np.nanmin(vi3)), float(np.nanmax(vi3))
+                        vmid = (vmin + vmax) / 2
+
+                        fig3d = go.Figure()
+
+                        # 레이어 1: Volume (전체 분포 — 반투명)
+                        fig3d.add_trace(go.Volume(
+                            x=xi3.flatten(), y=yi3.flatten(), z=zi3.flatten(),
+                            value=vi3.flatten(),
+                            isomin=vmin, isomax=vmax,
+                            opacity=0.12,
+                            surface_count=15,
+                            colorscale=colorscales[ft],
+                            showscale=False,
+                            caps=dict(x_show=False, y_show=False, z_show=False),
+                        ))
+
+                        # 레이어 2: Isosurface 등가면 (핵심 분포 경계)
+                        fig3d.add_trace(go.Isosurface(
+                            x=xi3.flatten(), y=yi3.flatten(), z=zi3.flatten(),
+                            value=vi3.flatten(),
+                            isomin=vmin + (vmax - vmin) * 0.25,
+                            isomax=vmax - (vmax - vmin) * 0.05,
+                            surface_count=5,
+                            colorscale=colorscales[ft],
+                            opacity=0.55,
+                            caps=dict(x_show=False, y_show=False, z_show=False),
+                            colorbar=dict(
+                                title=dict(text=field_options[ft], font=dict(color="#e2e8f0")),
+                                tickfont=dict(color="#e2e8f0"),
+                            ),
+                        ))
+
+                        # 레이어 3: 게이트 절대위치 마커 (앵커)
+                        fig3d.add_trace(go.Scatter3d(
+                            x=[gate_x], y=[gate_y], z=[gate_z],
+                            mode="markers+text",
+                            marker=dict(size=10, color="#ff4444", symbol="diamond",
+                                        line=dict(width=2, color="white")),
+                            text=["Gate"], textposition="top center",
+                            textfont=dict(color="white", size=11),
+                            name="Gate (Absolute)",
+                            showlegend=True,
+                        ))
+
+                        # 레이어 4: 유동 선단 (rel_dist > 0.85) 하이라이트
+                        front_df = cae_df[cae_df["rel_dist"] > 0.85]
+                        if len(front_df) > 0:
+                            fig3d.add_trace(go.Scatter3d(
+                                x=front_df["x"], y=front_df["y"], z=front_df["z"],
+                                mode="markers",
+                                marker=dict(size=4, color="#00ffcc", opacity=0.7,
+                                            symbol="circle"),
+                                name="Flow Front (>85%)",
+                                showlegend=True,
+                            ))
+
+                        fig3d.update_layout(
+                            scene=dict(
+                                xaxis_title=f"X (mm) | Gate={gate_x:.2f}",
+                                yaxis_title=f"Y (mm) | Gate={gate_y:.2f}",
+                                zaxis_title=f"Z (mm) | Gate={gate_z:.2f}",
+                                bgcolor="#111318",
+                                xaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                                           gridcolor="#252b36", showbackground=True),
+                                yaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                                           gridcolor="#252b36", showbackground=True),
+                                zaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                                           gridcolor="#252b36", showbackground=True),
+                                aspectmode="data",
+                            ),
+                            paper_bgcolor="#0a0c0f", font_color="#e2e8f0",
+                            height=500, margin=dict(l=0, r=0, t=40, b=0),
+                            title=dict(
+                                text=f"{field_options[ft]} Distribution  |  Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm",
+                                font=dict(color="#e2e8f0", size=13),
+                            ),
+                            legend=dict(
+                                bgcolor="rgba(17,19,24,0.8)", bordercolor="#252b36",
+                                font=dict(color="#e2e8f0"),
+                            ),
+                        )
+                        st.plotly_chart(fig3d, use_container_width=True)
+
+                        # ── 유동 선단 진행 정보 ──────────────────────────
+                        col_gi1, col_gi2, col_gi3 = st.columns(3)
+                        col_gi1.metric("🎯 Gate 절대위치",
+                                       f"({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm")
+                        col_gi2.metric("📏 최대 유동 거리", f"{max_dist:.2f} mm")
+                        col_gi3.metric("🌊 유동 선단 포인트", f"{len(front_df)}개")
+
+                    else:
+                        # ── 2D: heatmap interpolated ──────────────────
+                        from scipy.interpolate import griddata as gd2
+                        n2 = 60
+                        xi2 = np.linspace(x_min, x_max, n2)
+                        yi2 = np.linspace(y_min, y_max, n2)
+                        xi2g, yi2g = np.meshgrid(xi2, yi2)
+                        vi2 = gd2(cae_df[["x","y"]].values, cae_df[ft].values,
+                                  (xi2g, yi2g), method="linear")
+                        vi2_near = gd2(cae_df[["x","y"]].values, cae_df[ft].values,
+                                       (xi2g, yi2g), method="nearest")
+                        vi2[np.isnan(vi2)] = vi2_near[np.isnan(vi2)]
+
+                        fig2d = go.Figure()
+                        fig2d.add_trace(go.Heatmap(
+                            z=vi2, x=xi2, y=yi2,
+                            colorscale=colorscales[ft],
+                            colorbar=dict(title=field_options[ft]),
+                        ))
+                        # 게이트 마커
+                        fig2d.add_trace(go.Scatter(
+                            x=[gate_x], y=[gate_y], mode="markers+text",
+                            marker=dict(size=14, color="red", symbol="diamond"),
+                            text=["Gate"], textposition="top right",
+                            textfont=dict(color="white"),
+                        ))
+                        fig2d.update_layout(
+                            paper_bgcolor="#0a0c0f", plot_bgcolor="#111318",
+                            font_color="#e2e8f0", height=400,
+                            xaxis_title="X (mm)", yaxis_title="Y (mm)",
+                            margin=dict(l=20, r=20, t=30, b=20),
+                        )
+                        st.plotly_chart(fig2d, use_container_width=True)
 
             # 통계 지표
             c1, c2, c3, c4 = st.columns(4)
