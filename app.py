@@ -685,7 +685,80 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
         cae_df   = st.session_state["cae_df"]
         stats    = analysis["stats"]
 
-        # ── Tab: Field Map (3D scatter) ───────────────────
+        # ══════════════════════════════════════════════════════
+        #  STL 파싱 유틸 (trimesh 없이 순수 stdlib + numpy)
+        # ══════════════════════════════════════════════════════
+        def _parse_stl_binary(file_bytes: bytes):
+            """Binary STL → (vertices Nx3, faces Mx3) numpy arrays.
+            중복 vertex를 제거해 Mesh3d의 i/j/k 인덱스를 올바르게 반환."""
+            import struct
+            data = file_bytes
+            # 80 byte header + 4 byte tri count
+            tri_count = struct.unpack_from("<I", data, 80)[0]
+            offset = 84
+            raw_verts = []
+            for _ in range(tri_count):
+                offset += 12  # normal
+                v0 = struct.unpack_from("<3f", data, offset);  offset += 12
+                v1 = struct.unpack_from("<3f", data, offset);  offset += 12
+                v2 = struct.unpack_from("<3f", data, offset);  offset += 12
+                offset += 2   # attr byte
+                raw_verts.extend([v0, v1, v2])
+            verts_all = np.array(raw_verts, dtype=np.float64)  # (3*N, 3)
+            # 중복 제거 → 인덱스 배열 생성
+            verts_unique, inv_idx = np.unique(
+                np.round(verts_all, 6), axis=0, return_inverse=True
+            )
+            faces = inv_idx.reshape(-1, 3)  # (N, 3)
+            return verts_unique, faces
+
+        def _map_cae_to_mesh(vertices, cae_df, field, gate_pos):
+            """각 mesh vertex에 가장 가까운 CAE 포인트의 field 값을 거리 역가중 평균으로 매핑."""
+            cae_xyz = cae_df[["x", "y", "z"]].values if "z" in cae_df.columns \
+                      else np.column_stack([cae_df["x"].values, cae_df["y"].values,
+                                            np.zeros(len(cae_df))])
+            cae_vals = cae_df[field].values.astype(float)
+
+            # 좌표계 스케일 맞추기 — bounding box 기반 정규화
+            v_min = vertices.min(axis=0)
+            v_max = vertices.max(axis=0)
+            c_min = cae_xyz.min(axis=0)
+            c_max = cae_xyz.max(axis=0)
+            v_range = np.where((v_max - v_min) > 0, v_max - v_min, 1.0)
+            c_range = np.where((c_max - c_min) > 0, c_max - c_min, 1.0)
+            verts_norm = (vertices - v_min) / v_range
+            cae_norm   = (cae_xyz  - c_min) / c_range
+
+            # 각 vertex에 대해 k=5 근접 포인트 IDW 보간
+            k = min(5, len(cae_norm))
+            intensity = np.zeros(len(verts_norm))
+            for vi in range(0, len(verts_norm), max(1, len(verts_norm)//500)):
+                diffs = cae_norm - verts_norm[vi]
+                dists = np.linalg.norm(diffs, axis=1)
+                idx_k = np.argpartition(dists, k)[:k]
+                d_k   = dists[idx_k]
+                if d_k.min() < 1e-9:
+                    intensity[vi] = cae_vals[idx_k[d_k.argmin()]]
+                else:
+                    w = 1.0 / (d_k ** 2)
+                    intensity[vi] = np.dot(w, cae_vals[idx_k]) / w.sum()
+
+            # 벡터화 구간은 위 루프로 처리했으므로 남은 vertex 처리
+            for vi in range(0, len(verts_norm)):
+                if intensity[vi] != 0:
+                    continue
+                diffs = cae_norm - verts_norm[vi]
+                dists = np.linalg.norm(diffs, axis=1)
+                idx_k = np.argpartition(dists, k)[:k]
+                d_k   = dists[idx_k]
+                if d_k.min() < 1e-9:
+                    intensity[vi] = cae_vals[idx_k[d_k.argmin()]]
+                else:
+                    w = 1.0 / (d_k ** 2)
+                    intensity[vi] = np.dot(w, cae_vals[idx_k]) / w.sum()
+            return intensity
+
+        # ── Tab: Field Map (STL Mesh3d) ───────────────────
         with tab_field:
             st.markdown(f"#### 📊 {T.get('title_field_map', 'Field Distribution Map')}")
 
@@ -699,43 +772,65 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
                 f"🔴 {field_options['temperature']} (°C)",
                 f"🟢 {field_options['fill_time']} (s)",
             ])
-            colorscales = {"pressure": "Blues", "temperature": "Hot", "fill_time": "Viridis"}
             fields = list(field_options.keys())
+            colorscales = {"pressure": "Jet", "temperature": "Hot", "fill_time": "Viridis"}
+            cb_titles   = {"pressure": "Pressure (MPa)", "temperature": "Temp (°C)", "fill_time": "Fill Time (s)"}
 
-            # ── 게이트 위치 절대좌표 앵커링 ─────────────────────────
-            # fill_time이 가장 작은 점 = 게이트 (금속이 처음 도달한 지점)
+            # ── 게이트 위치 ──────────────────────────────────────
             has_z_global = "z" in cae_df.columns
             gate_row = cae_df.loc[cae_df["fill_time"].idxmin()]
             gate_x = float(gate_row["x"])
             gate_y = float(gate_row["y"])
             gate_z = float(gate_row["z"]) if has_z_global else 0.0
 
-            # ── 상대좌표 계산 (Bounding Box 정규화) ──────────────────
-            x_min, x_max = cae_df["x"].min(), cae_df["x"].max()
-            y_min, y_max = cae_df["y"].min(), cae_df["y"].max()
-            z_min, z_max = (cae_df["z"].min(), cae_df["z"].max()) if has_z_global else (0, 1)
-            x_range = x_max - x_min if x_max != x_min else 1
-            y_range = y_max - y_min if y_max != y_min else 1
-            z_range = z_max - z_min if z_max != z_min else 1
-
-            # 게이트로부터의 거리 (유동 선단 추적용)
+            # 게이트 거리 / 유동선단
             if has_z_global:
                 cae_df["dist_from_gate"] = np.sqrt(
-                    (cae_df["x"] - gate_x)**2 +
-                    (cae_df["y"] - gate_y)**2 +
-                    (cae_df["z"] - gate_z)**2
-                )
+                    (cae_df["x"] - gate_x)**2 + (cae_df["y"] - gate_y)**2 + (cae_df["z"] - gate_z)**2)
             else:
                 cae_df["dist_from_gate"] = np.sqrt(
-                    (cae_df["x"] - gate_x)**2 + (cae_df["y"] - gate_y)**2
-                )
+                    (cae_df["x"] - gate_x)**2 + (cae_df["y"] - gate_y)**2)
             max_dist = cae_df["dist_from_gate"].max()
-            cae_df["rel_dist"] = cae_df["dist_from_gate"] / max_dist  # 0=게이트, 1=유동선단
+            cae_df["rel_dist"] = cae_df["dist_from_gate"] / max_dist
+            front_df = cae_df[cae_df["rel_dist"] > 0.85]
 
-            # ── 공통 scene / layout 설정 ─────────────────────────────
+            # ── STL 파싱 (session_state 캐시) ───────────────────
+            stl_mesh_data = st.session_state.get("_stl_mesh_cache")
+
+            # STL 업로드 위젯 (Field Map 탭 상단)
+            stl_col1, stl_col2 = st.columns([3, 1])
+            with stl_col1:
+                stl_upload_field = st.file_uploader(
+                    "🗂️ STL 파일 업로드 (형상 위에 분포도 표시)",
+                    type=["stl"], key="stl_field_uploader",
+                    help="업로드하면 실제 3D 모델 표면에 압력/온도/충진시간 컨투어가 표시됩니다."
+                )
+            with stl_col2:
+                st.write("")
+                st.write("")
+                if stl_mesh_data:
+                    st.success(f"✅ {stl_mesh_data['name']}\n({stl_mesh_data['n_faces']:,} faces)")
+
+            if stl_upload_field is not None:
+                with st.spinner("STL 파싱 중..."):
+                    try:
+                        file_bytes = stl_upload_field.read()
+                        verts, faces = _parse_stl_binary(file_bytes)
+                        st.session_state["_stl_mesh_cache"] = {
+                            "vertices": verts,
+                            "faces": faces,
+                            "name": stl_upload_field.name,
+                            "n_faces": len(faces),
+                            "intensity_cache": {},  # field → array
+                        }
+                        stl_mesh_data = st.session_state["_stl_mesh_cache"]
+                        st.success(f"✅ STL 로드 완료: {len(verts):,} vertices, {len(faces):,} faces")
+                    except Exception as _stl_e:
+                        st.error(f"STL 파싱 오류: {_stl_e}")
+
+            # ── 공통 scene / layout ──────────────────────────────
             _scene_cfg = dict(
-                xaxis_title="X (mm)", yaxis_title="Y (mm)",
-                zaxis_title="Z (mm)" if has_z_global else "",
+                xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)",
                 bgcolor="#111318",
                 xaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
                            gridcolor="#252b36", showbackground=True),
@@ -747,13 +842,11 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
             )
             _layout_cfg = dict(
                 paper_bgcolor="#0a0c0f", font_color="#e2e8f0",
-                height=520, margin=dict(l=0, r=0, t=45, b=0),
+                height=580, margin=dict(l=0, r=0, t=45, b=0),
                 legend=dict(bgcolor="rgba(17,19,24,0.85)",
-                            bordercolor="#252b36",
-                            font=dict(color="#e2e8f0")),
+                            bordercolor="#252b36", font=dict(color="#e2e8f0")),
             )
 
-            # 게이트 마커 (공통)
             def _gate_trace_3d(zv):
                 return go.Scatter3d(
                     x=[gate_x], y=[gate_y], z=[zv],
@@ -766,102 +859,127 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
                     showlegend=True,
                 )
 
-            front_df = cae_df[cae_df["rel_dist"] > 0.85]
-            z_col    = cae_df["z"] if has_z_global else pd.Series([0.0]*len(cae_df),
-                                                                    index=cae_df.index)
-            z_gate   = gate_z if has_z_global else 0.0
-
             for i, ftab in enumerate(field_tabs):
                 ft = fields[i]
                 with ftab:
-                    if ft not in cae_df.columns or "x" not in cae_df.columns:
+                    if ft not in cae_df.columns:
                         st.info(f"No '{ft}' column in data.")
                         continue
 
-                    # ── 필드별 시각화 파라미터 ─────────────────────────
-                    if ft == "pressure":
-                        # 게이트 가까울수록 큰 점
-                        dist_norm    = cae_df["rel_dist"]
-                        pt_size_arr  = (4 + 8 * (1 - dist_norm)).clip(4, 12).tolist()
-                        pt_color     = cae_df["pressure"]
-                        cscale       = "Blues"
-                        pt_opacity   = 0.85          # ← 반드시 단일 float
-                        cb_title     = "Pressure (MPa)"
-                        extra_trace  = None
-
-                    elif ft == "temperature":
-                        pt_size_arr  = 7
-                        pt_color     = cae_df["temperature"]
-                        cscale       = "Hot"
-                        pt_opacity   = 0.85          # ← 반드시 단일 float
-                        cb_title     = "Temp (°C)"
-                        extra_trace  = None
-
-                    else:  # fill_time
-                        pt_size_arr  = 7
-                        pt_color     = cae_df["fill_time"]
-                        cscale       = "Viridis"
-                        pt_opacity   = 0.85
-                        cb_title     = "Fill Time (s)"
-                        # 유동 선단 오버레이
-                        extra_trace  = go.Scatter3d(
-                            x=front_df["x"], y=front_df["y"],
-                            z=front_df["z"] if has_z_global else [0.0]*len(front_df),
-                            mode="markers",
-                            marker=dict(size=9, color="#00ffcc", opacity=1.0,
-                                        symbol="circle",
-                                        line=dict(color="#ffffff", width=1)),
-                            name="🟢 Flow Front (>85%)",
-                            showlegend=True,
-                        ) if len(front_df) > 0 else None
-
-                    # ── 메인 포인트 클라우드 ────────────────────────────
                     fig3d = go.Figure()
-                    fig3d.add_trace(go.Scatter3d(
-                        x=cae_df["x"],
-                        y=cae_df["y"],
-                        z=z_col,
-                        mode="markers",
-                        marker=dict(
-                            size=pt_size_arr,
-                            color=pt_color,
-                            colorscale=cscale,
+
+                    # ── 분기: STL 있으면 Mesh3d, 없으면 개선된 Scatter3d ──
+                    if stl_mesh_data is not None:
+                        verts  = stl_mesh_data["vertices"]
+                        faces  = stl_mesh_data["faces"]
+
+                        # 인텐시티 캐시 (재계산 방지)
+                        if ft not in stl_mesh_data.get("intensity_cache", {}):
+                            with st.spinner(f"🔄 {field_options[ft]} → Mesh 매핑 중 (최초 1회)..."):
+                                gate_pos = np.array([gate_x, gate_y, gate_z])
+                                intensity = _map_cae_to_mesh(verts, cae_df, ft, gate_pos)
+                                stl_mesh_data["intensity_cache"][ft] = intensity
+                                st.session_state["_stl_mesh_cache"] = stl_mesh_data
+                        else:
+                            intensity = stl_mesh_data["intensity_cache"][ft]
+
+                        fig3d.add_trace(go.Mesh3d(
+                            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                            intensity=intensity,
+                            colorscale=colorscales[ft],
                             colorbar=dict(
-                                title=dict(text=cb_title,
-                                           font=dict(color="#e2e8f0")),
-                                tickfont=dict(color="#e2e8f0"),
-                                x=1.02,
+                                title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
+                                tickfont=dict(color="#e2e8f0"), x=1.02,
                             ),
-                            opacity=pt_opacity,   # 단일 float — 배열 불가
-                            line=dict(width=0),
-                        ),
-                        customdata=np.stack([
-                            cae_df[ft].values,
-                            cae_df["rel_dist"].values,
-                            cae_df["fill_time"].values,
-                        ], axis=-1),
-                        hovertemplate=(
-                            f"<b>{field_options[ft]}: %{{customdata[0]:.2f}}</b><br>"
-                            "X: %{x:.3f} mm | Y: %{y:.3f} mm<br>"
-                            "Gate Dist: %{customdata[1]:.0%}<br>"
-                            "Fill Time: %{customdata[2]:.2f} s<extra></extra>"
-                        ),
-                        name=f"{field_options[ft]} Field",
-                        showlegend=True,
-                    ))
+                            opacity=1.0,
+                            flatshading=False,       # smooth shading
+                            lighting=dict(ambient=0.5, diffuse=0.8,
+                                          specular=0.3, roughness=0.5),
+                            lightposition=dict(x=1, y=1, z=2),
+                            name=f"{field_options[ft]} (Mesh)",
+                            showlegend=True,
+                            hovertemplate=(
+                                f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
+                                "X: %{x:.3f} mm<br>Y: %{y:.3f} mm<br>"
+                                "Z: %{z:.3f} mm<extra></extra>"
+                            ),
+                        ))
 
-                    if extra_trace is not None:
-                        fig3d.add_trace(extra_trace)
+                        # 유동선단 오버레이 (fill_time 탭)
+                        if ft == "fill_time" and len(front_df) > 0:
+                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
+                            fig3d.add_trace(go.Scatter3d(
+                                x=front_df["x"], y=front_df["y"], z=fz,
+                                mode="markers",
+                                marker=dict(size=5, color="#00ffcc", opacity=0.9,
+                                            line=dict(color="#ffffff", width=0.5)),
+                                name="🟢 Flow Front (>85%)", showlegend=True,
+                            ))
 
-                    # ── 게이트 앵커 ─────────────────────────────────────
-                    fig3d.add_trace(_gate_trace_3d(z_gate))
+                    else:
+                        # ── STL 없음: Scatter3d (개선형, 에러 없음) ─────────
+                        pt_color = cae_df[ft].values
+                        z_col = cae_df["z"].values if has_z_global else np.zeros(len(cae_df))
+
+                        if ft == "pressure":
+                            pt_size = (4 + 8 * (1 - cae_df["rel_dist"].values)).clip(4, 12).tolist()
+                        else:
+                            pt_size = 7
+
+                        fig3d.add_trace(go.Scatter3d(
+                            x=cae_df["x"], y=cae_df["y"], z=z_col,
+                            mode="markers",
+                            marker=dict(
+                                size=pt_size,
+                                color=pt_color,
+                                colorscale=colorscales[ft],
+                                colorbar=dict(
+                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
+                                    tickfont=dict(color="#e2e8f0"), x=1.02,
+                                ),
+                                opacity=0.85,
+                                line=dict(width=0),
+                            ),
+                            customdata=np.stack([
+                                cae_df[ft].values,
+                                cae_df["rel_dist"].values,
+                                cae_df["fill_time"].values,
+                            ], axis=-1),
+                            hovertemplate=(
+                                f"<b>{field_options[ft]}: %{{customdata[0]:.2f}}</b><br>"
+                                "X: %{x:.3f} mm | Y: %{y:.3f} mm<br>"
+                                "Gate Dist: %{customdata[1]:.0%}<br>"
+                                "Fill Time: %{customdata[2]:.2f} s<extra></extra>"
+                            ),
+                            name=f"{field_options[ft]} (Point Cloud)",
+                            showlegend=True,
+                        ))
+
+                        if ft == "fill_time" and len(front_df) > 0:
+                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
+                            fig3d.add_trace(go.Scatter3d(
+                                x=front_df["x"], y=front_df["y"], z=fz,
+                                mode="markers",
+                                marker=dict(size=9, color="#00ffcc", opacity=1.0,
+                                            line=dict(color="#ffffff", width=1)),
+                                name="🟢 Flow Front (>85%)", showlegend=True,
+                            ))
+
+                        st.info("💡 STL 파일을 업로드하면 실제 형상 표면에 컨투어가 표시됩니다.")
+
+                    # 게이트 마커 공통
+                    fig3d.add_trace(_gate_trace_3d(gate_z))
 
                     fig3d.update_layout(
                         **_layout_cfg,
                         scene=_scene_cfg,
                         title=dict(
-                            text=(f"{field_options[ft]} Distribution  "
-                                  f"| Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"),
+                            text=(
+                                f"{field_options[ft]} Distribution"
+                                f"{'  [Mesh3d — STL Surface]' if stl_mesh_data else '  [Point Cloud]'}"
+                                f"  |  Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"
+                            ),
                             font=dict(color="#e2e8f0", size=13),
                         ),
                     )
