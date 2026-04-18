@@ -989,23 +989,32 @@ elif current_stage == "stage1":
 
                 def _fetch_artifacts_direct(per_page: int = 50) -> list:
                     """Fetch artifact list directly via GitHub API."""
+                    # flow_csv_generator._get_token()과 동일한 방식
+                    token = ""
                     try:
-                        token = st.secrets["GITHUB_TOKEN"]
-                    except (KeyError, FileNotFoundError, Exception):
-                        raise RuntimeError(
-                            "GITHUB_TOKEN not found in secrets. "
-                            "Go to your app → ⋯ → Edit secrets and add it."
-                        )
-
+                        token = st.secrets.get("GITHUB_TOKEN", "")
+                    except Exception:
+                        pass
+                    if not token:
+                        token = os.environ.get("GITHUB_TOKEN", "")
                     if not token or str(token).strip() in ("", "ghp_YOUR_TOKEN_HERE", "ghp_xxxxxxxxxxxx"):
-                        raise RuntimeError("GITHUB_TOKEN is set but appears to be a placeholder. Please replace it with your actual token.")
+                        raise RuntimeError("GITHUB_TOKEN not found. Check secrets or environment variables.")
 
-                    owner = (st.secrets.get("OPENFOAM_REPO_OWNER")
-                             or st.secrets.get("REPO_OWNER")
-                             or "workshopcompany")
-                    repo  = (st.secrets.get("OPENFOAM_REPO_NAME")
-                             or st.secrets.get("REPO_NAME")
-                             or "OpenFOAM-Injection-Automation")
+                    owner = ""
+                    try:
+                        owner = st.secrets.get("OPENFOAM_REPO_OWNER", st.secrets.get("REPO_OWNER", ""))
+                    except Exception:
+                        pass
+                    if not owner:
+                        owner = os.environ.get("OPENFOAM_REPO_OWNER", os.environ.get("REPO_OWNER", "workshopcompany"))
+
+                    repo = ""
+                    try:
+                        repo = st.secrets.get("OPENFOAM_REPO_NAME", st.secrets.get("REPO_NAME", ""))
+                    except Exception:
+                        pass
+                    if not repo:
+                        repo = os.environ.get("OPENFOAM_REPO_NAME", os.environ.get("REPO_NAME", "OpenFOAM-Injection-Automation"))
 
                     url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
                     headers = {
