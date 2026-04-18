@@ -1610,21 +1610,21 @@ elif current_stage == "stage1":
 
                     # ══ 분기 1: CAE 포인트 → Cell Mesh (Moldflow 스타일) ═════
                     if _has_voxel_data:
-                        # 1. 격자 정밀도를 위해 샘플링 수를 조절 (15,000~20,000 추천)
+                        # 1. 데이터 샘플링 (들여쓰기: 2단 탭 / 20칸 추천)
                         _MAX_PTS = 20000
                         vdf = cae_df.sample(min(len(cae_df), _MAX_PTS))
                         
-                        # 2. 원본 데이터의 각 좌표(x,y,z)에 사각형(Voxel) 마커를 직접 배치
+                        # 2. Voxel(격자) 시각화
                         fig3d.add_trace(go.Scatter3d(
                             x=vdf["x"], y=vdf["y"], z=vdf["z"],
                             mode='markers',
                             marker=dict(
-                                size=5,            # 격자 사이가 벌어져 보이면 6~8로 키우세요
-                                symbol='square',   # 사각형 마커를 사용하여 Voxel 격자 느낌 구현
-                                color=vdf[ft],     # 각 셀마다 할당된 실제 데이터 값 (온도/압력 등)
+                                size=6,
+                                symbol='square',
+                                color=vdf[ft],
                                 colorscale=colorscales[ft],
-                                opacity=1.0,       # 내부가 꽉 찬 덩어리 느낌을 위해 불투명 설정
-                                showscale=False    # 컬러바 중복 방지
+                                opacity=1.0,
+                                showscale=False
                             ),
                             name=f"{field_options[ft]} (Voxel Grid)",
                             hovertemplate=(
@@ -1633,9 +1633,10 @@ elif current_stage == "stage1":
                             )
                         ))
                         _render_label = f"Voxel Grid ({len(vdf):,} cells)"
-                        else:
-                            st.warning("셀 메쉬 생성 실패 — 데이터를 확인하세요.")
-                            _render_label = "Cell Mesh (error)"
+
+                    else:  # 이 else가 위 if _has_voxel_data와 정확히 세로 줄이 맞아야 합니다.
+                        st.warning("표시할 Voxel 데이터가 없습니다.")
+                        _render_label = "No Voxel Data"
 
                         # 유동선단 오버레이 (fill_time 탭)
                         if ft == "fill_time" and len(front_df) > 0:
