@@ -1610,43 +1610,29 @@ elif current_stage == "stage1":
 
                     # ══ 분기 1: CAE 포인트 → Cell Mesh (Moldflow 스타일) ═════
                     if _has_voxel_data:
-                        cell_data = _build_cell_mesh(cae_df, ft, max_pts=6000)
-
-                        if cell_data is not None:
-                            # facecolor(face별 flat 색상)을 intensity로 사용하려면
-                            # vertex 수 = len(x), face intensity = facecolor
-                            # Plotly Mesh3d는 intensitymode="cell" 지원 (vertex count = n_faces)
-                            # → facecolor 배열은 face 수와 동일해야 함
-                            # → intensitymode="vertex" + vertex-level intensity 사용 (smooth)
-                            # → intensitymode="cell" + facecolor 배열 사용 (flat, Moldflow)
-
-                            fig3d.add_trace(go.Mesh3d(
-                                x=cell_data["x"],
-                                y=cell_data["y"],
-                                z=cell_data["z"],
-                                i=cell_data["i"],
-                                j=cell_data["j"],
-                                k=cell_data["k"],
-                                intensity=cell_data["facecolor"],   # face당 하나의 값
-                                intensitymode="cell",               # ← Moldflow 스타일: 셀마다 독립 색상
+                        # 1. 격자 정밀도를 위해 샘플링 수를 조절 (15,000~20,000 추천)
+                        _MAX_PTS = 20000
+                        vdf = cae_df.sample(min(len(cae_df), _MAX_PTS))
+                        
+                        # 2. 원본 데이터의 각 좌표(x,y,z)에 사각형(Voxel) 마커를 직접 배치
+                        fig3d.add_trace(go.Scatter3d(
+                            x=vdf["x"], y=vdf["y"], z=vdf["z"],
+                            mode='markers',
+                            marker=dict(
+                                size=5,            # 격자 사이가 벌어져 보이면 6~8로 키우세요
+                                symbol='square',   # 사각형 마커를 사용하여 Voxel 격자 느낌 구현
+                                color=vdf[ft],     # 각 셀마다 할당된 실제 데이터 값 (온도/압력 등)
                                 colorscale=colorscales[ft],
-                                colorbar=dict(
-                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
-                                    tickfont=dict(color="#e2e8f0"), x=1.02,
-                                ),
-                                opacity=1.0,
-                                flatshading=True,                   # flat → 각 셀이 단색으로 채워짐
-                                lighting=dict(ambient=0.9, diffuse=0.3,
-                                              specular=0.0, roughness=1.0),
-                                name=f"{field_options[ft]} (Cell Mesh)",
-                                showlegend=True,
-                                hovertemplate=(
-                                    f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
-                                    "X: %{x:.2f} mm | Y: %{y:.2f} mm"
-                                    "<extra></extra>"
-                                ),
-                            ))
-                            _render_label = f"Cell Mesh ({cell_data['n_cells']:,} cells)"
+                                opacity=1.0,       # 내부가 꽉 찬 덩어리 느낌을 위해 불투명 설정
+                                showscale=False    # 컬러바 중복 방지
+                            ),
+                            name=f"{field_options[ft]} (Voxel Grid)",
+                            hovertemplate=(
+                                f"<b>{field_options[ft]}: %{{marker.color:.2f}}</b><br>"
+                                "X: %{x:.2f} | Y: %{y:.2f} | Z: %{z:.2f}<extra></extra>"
+                            )
+                        ))
+                        _render_label = f"Voxel Grid ({len(vdf):,} cells)"
                         else:
                             st.warning("셀 메쉬 생성 실패 — 데이터를 확인하세요.")
                             _render_label = "Cell Mesh (error)"
