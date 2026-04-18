@@ -1428,6 +1428,12 @@ elif current_stage == "stage1":
                     showlegend=True,
                 )
 
+            # flow_weight 컬럼 존재 = solver 실좌표 데이터 → Volume 렌더링 가능
+            _has_voxel_data = "flow_weight" in cae_df.columns
+
+            # Volume 렌더링용 다운샘플 한도 (브라우저 부담 방지)
+            _VOL_MAX_PTS = 8000
+
             for i, ftab in enumerate(field_tabs):
                 ft = fields[i]
                 with ftab:
@@ -1437,16 +1443,78 @@ elif current_stage == "stage1":
 
                     fig3d = go.Figure()
 
-                    # ── 분기: STL 있으면 Mesh3d, 없으면 개선된 Scatter3d ──
-                    if stl_mesh_data is not None:
+                    # ══ 분기 1: solver 실좌표 → Volume 렌더링 ═══════════════
+                    if _has_voxel_data:
+                        # 다운샘플 (포인트 과다 시 균등 간격)
+                        _df = cae_df
+                        if len(_df) > _VOL_MAX_PTS:
+                            _step = max(1, len(_df) // _VOL_MAX_PTS)
+                            _df = _df.iloc[::_step].copy()
+
+                        _vals = _df[ft].values.astype(float)
+                        _z_v  = _df["z"].values if has_z_global else np.zeros(len(_df))
+
+                        # opacity scale: 값이 클수록 진하게 (fill_time은 반전)
+                        if ft == "fill_time":
+                            _op_vals = 1.0 - (_vals - _vals.min()) / max(_vals.ptp(), 1e-6)
+                        else:
+                            _op_vals = (_vals - _vals.min()) / max(_vals.ptp(), 1e-6)
+                        _opscale = [
+                            [0.0, "rgba(0,0,0,0.0)"],
+                            [0.15, "rgba(0,0,0,0.05)"],
+                            [0.5,  "rgba(0,0,0,0.35)"],
+                            [1.0,  "rgba(0,0,0,0.90)"],
+                        ]
+
+                        fig3d.add_trace(go.Volume(
+                            x=_df["x"].values,
+                            y=_df["y"].values,
+                            z=_z_v,
+                            value=_vals,
+                            isomin=float(_vals.min()),
+                            isomax=float(_vals.max()),
+                            opacity=0.15,          # 전체 투명도 (내부 투시)
+                            surface_count=15,      # 등가면 수 — 많을수록 꽉 찬 느낌
+                            colorscale=colorscales[ft],
+                            colorbar=dict(
+                                title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
+                                tickfont=dict(color="#e2e8f0"), x=1.02,
+                            ),
+                            caps=dict(
+                                x_show=True, y_show=True, z_show=True,
+                                x_fill=1, y_fill=1, z_fill=1,
+                            ),
+                            name=f"{field_options[ft]} (Volume)",
+                            showlegend=True,
+                            hovertemplate=(
+                                f"<b>{field_options[ft]}: %{{value:.2f}}</b><br>"
+                                "X: %{x:.2f} mm | Y: %{y:.2f} mm | Z: %{z:.2f} mm"
+                                "<extra></extra>"
+                            ),
+                        ))
+
+                        # 유동선단 오버레이 (fill_time 탭)
+                        if ft == "fill_time" and len(front_df) > 0:
+                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
+                            fig3d.add_trace(go.Scatter3d(
+                                x=front_df["x"], y=front_df["y"], z=fz,
+                                mode="markers",
+                                marker=dict(size=4, color="#00ffcc", opacity=0.9,
+                                            line=dict(color="#ffffff", width=0.5)),
+                                name="🟢 Flow Front (>85%)", showlegend=True,
+                            ))
+
+                        _render_label = "Volume (Solid Voxel)"
+
+                    # ══ 분기 2: STL 있으면 Mesh3d ════════════════════════════
+                    elif stl_mesh_data is not None:
                         verts  = stl_mesh_data["vertices"]
                         faces  = stl_mesh_data["faces"]
 
-                        # 인텐시티 캐시 (재계산 방지)
                         if ft not in stl_mesh_data.get("intensity_cache", {}):
                             with st.spinner(f"🔄 {field_options[ft]} → Mesh 매핑 중 (최초 1회)..."):
-                                gate_pos = np.array([gate_x, gate_y, gate_z])
-                                intensity = _map_cae_to_mesh(verts, cae_df, ft, gate_pos)
+                                gate_pos_arr = np.array([gate_x, gate_y, gate_z])
+                                intensity = _map_cae_to_mesh(verts, cae_df, ft, gate_pos_arr)
                                 stl_mesh_data["intensity_cache"][ft] = intensity
                                 st.session_state["_stl_mesh_cache"] = stl_mesh_data
                         else:
@@ -1462,7 +1530,7 @@ elif current_stage == "stage1":
                                 tickfont=dict(color="#e2e8f0"), x=1.02,
                             ),
                             opacity=1.0,
-                            flatshading=False,       # smooth shading
+                            flatshading=False,
                             lighting=dict(ambient=0.5, diffuse=0.8,
                                           specular=0.3, roughness=0.5),
                             lightposition=dict(x=1, y=1, z=2),
@@ -1475,7 +1543,6 @@ elif current_stage == "stage1":
                             ),
                         ))
 
-                        # 유동선단 오버레이 (fill_time 탭)
                         if ft == "fill_time" and len(front_df) > 0:
                             fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
                             fig3d.add_trace(go.Scatter3d(
@@ -1486,8 +1553,10 @@ elif current_stage == "stage1":
                                 name="🟢 Flow Front (>85%)", showlegend=True,
                             ))
 
+                        _render_label = "Mesh3d — STL Surface"
+
+                    # ══ 분기 3: Scatter3d (fallback) ══════════════════════════
                     else:
-                        # ── STL 없음: Scatter3d (개선형, 에러 없음) ─────────
                         pt_color = cae_df[ft].values
                         z_col = cae_df["z"].values if has_z_global else np.zeros(len(cae_df))
 
@@ -1535,9 +1604,10 @@ elif current_stage == "stage1":
                                 name="🟢 Flow Front (>85%)", showlegend=True,
                             ))
 
-                        st.info("💡 STL 파일을 업로드하면 실제 형상 표면에 컨투어가 표시됩니다.")
+                        st.info("💡 Signal ID로 시뮬레이션 결과를 로드하면 Volume 렌더링으로 전환됩니다.")
+                        _render_label = "Point Cloud"
 
-                    # 게이트 마커 공통
+                    # ── 게이트 마커 공통 ──────────────────────────────────
                     fig3d.add_trace(_gate_trace_3d(gate_z))
 
                     fig3d.update_layout(
@@ -1546,7 +1616,7 @@ elif current_stage == "stage1":
                         title=dict(
                             text=(
                                 f"{field_options[ft]} Distribution"
-                                f"{'  [Mesh3d — STL Surface]' if stl_mesh_data else '  [Point Cloud]'}"
+                                f"  [{_render_label}]"
                                 f"  |  Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"
                             ),
                             font=dict(color="#e2e8f0", size=13),
