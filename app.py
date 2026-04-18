@@ -1431,11 +1431,12 @@ elif current_stage == "stage1":
                     # ══════════════════════════════════════════════════════
                     _avg_t = float(st.session_state.get("avg_thickness", 2.4))
 
-                    def _build_cell_mesh(df_in, field_col, avg_thickness=2.4):
+                    def _build_cell_mesh(df_in, field_col, avg_thickness=2.4, stl_verts=None):
                         """
                         CAE 포인트 → 복셀 Cell Mesh.
                         셀 크기 = avg_thickness / 10  (사용자 설정 두께 기준)
                         총 셀 수 80,000개 이하로 clamp (렌더링 성능)
+                        stl_verts 제공 시: STL XY 풋프린트 외부 셀 NaN 마스킹 (형상 밖 셀 제거)
                         """
                         _df = df_in.copy()
                         if len(_df) == 0:
@@ -1497,6 +1498,24 @@ elif current_stage == "stage1":
                                         sl=pad[di:di+nx,dj:dj+ny,dk:dk+nz]; v=~np.isnan(sl)
                                         ss+=np.where(v,sl,0); sc+=v.astype(float)
                             fm=empty&(sc>0); vox_val[fm]=ss[fm]/sc[fm]
+
+                        # ── STL XY 풋프린트 마스킹 ──────────────────────────
+                        # STL 꼭짓점의 XY 투영으로 Delaunay 삼각분할 생성 →
+                        # 각 복셀 중심점 (cx, cy) 가 그 안에 있는지 확인 →
+                        # 밖에 있는 셀은 NaN으로 제거 (형상 밖으로 삐져나오지 않음)
+                        if stl_verts is not None and len(stl_verts) >= 4:
+                            try:
+                                from scipy.spatial import Delaunay as _Delaunay
+                                _stl_xy  = stl_verts[:, :2].astype(np.float64)
+                                _dln     = _Delaunay(_stl_xy)
+                                # 모든 (i, j) 셀 중심점 일괄 검사
+                                _ii, _jj = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+                                _test_xy = np.column_stack([cx_[_ii.ravel()], cy_[_jj.ravel()]])
+                                _inside  = (_dln.find_simplex(_test_xy) >= 0).reshape(nx, ny)
+                                # 바깥 셀 전 z-층 NaN
+                                vox_val[~_inside, :] = np.nan
+                            except Exception:
+                                pass  # scipy 없거나 실패 시 마스킹 생략
                         cx_=(x_bins[:-1]+x_bins[1:])/2; cy_=(y_bins[:-1]+y_bins[1:])/2; cz_=(z_bins[:-1]+z_bins[1:])/2
                         dx2=(x_bins[1]-x_bins[0])/2; dy2=(y_bins[1]-y_bins[0])/2; dz2=(z_bins[1]-z_bins[0])/2
                         face_defs=[
@@ -1533,8 +1552,10 @@ elif current_stage == "stage1":
                             "nx":nx, "ny":ny, "nz":nz,
                         }
 
+                    _stl_verts_for_mask = stl_mesh_data["vertices"] if stl_mesh_data is not None else None
                     with st.spinner(f"🔄 Building Cell Mesh (cell ≈ {_avg_t/10:.2f} mm)..."):
-                        cell_data = _build_cell_mesh(cae_df, ft, avg_thickness=_avg_t)
+                        cell_data = _build_cell_mesh(cae_df, ft, avg_thickness=_avg_t,
+                                                     stl_verts=_stl_verts_for_mask)
 
                     if cell_data is not None:
                         _cs = cell_data.get("cell_size", _avg_t / 10)
@@ -1560,8 +1581,8 @@ elif current_stage == "stage1":
                             f"📐 Grid: **{cell_data['nx']} × {cell_data['ny']} × {cell_data['nz']}** cells"
                             f" | cell size ≈ **{_cs:.3f} mm**"
                             f" (avg_thickness {_avg_t:.1f} mm ÷ 10)"
-                            + (f" | STL outline overlay ✅" if stl_mesh_data else
-                               "  — _Upload STL for geometry outline_")
+                            + (f" | ✂️ STL XY 마스킹 적용 (형상 밖 셀 제거됨)" if stl_mesh_data else
+                               "  — _Upload STL to clip cells to geometry boundary_")
                         )
                     else:
                         st.warning("Cell mesh generation failed — check data.")
