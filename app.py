@@ -18,11 +18,13 @@ import requests
 
 # ══════════════════════════════════════════════════════════
 #  VTK/VTU 파서 — pyvista 없이 stdlib만 사용
-#  OpenFOAM foamToVTK 결과 (.vtu ASCII/Binary, .vtm, ZIP) 처리
+#  지원 형식:
+#   A) ASCII VTU (format="ascii")  ← 이전 OpenFOAM 결과
+#   B) Appended+Base64+ZLib VTU    ← MIM-Ops GitHub Actions 결과
+#   C) 위 파일이 담긴 ZIP
 #  NumPy 2.0 완전 호환 (ptp() 미사용)
 # ══════════════════════════════════════════════════════════
 
-# VTK DataArray type → numpy dtype 매핑
 _VTK_DTYPE = {
     "Float32": np.float32, "Float64": np.float64,
     "Int8": np.int8,  "Int16": np.int16,
@@ -33,83 +35,227 @@ _VTK_DTYPE = {
 
 def _vtk_clean_xml(text: str) -> str:
     """싱글/더블 쿼트 xmlns 속성 모두 제거 (ET 파싱 전처리)."""
-    # xmlns:xxx='...' 및 xmlns='...' (싱글/더블 쿼트 모두)
-    text = re.sub(r""" xmlns(?::[a-zA-Z0-9_]+)?=['\"][^'\"]*['\"]""", "", text)
-    return text
+    return re.sub(r""" xmlns(?::[a-zA-Z0-9_]+)?=['\"][^'\"]*['\"]""", "", text)
 
-def _read_dataarray(node: ET.Element) -> np.ndarray:
-    """
-    VTK DataArray 노드 → float64 ndarray.
-    ASCII: text 직접 파싱
-    Binary (base64 inline): UInt32/UInt64 헤더 + 데이터 블록 디코딩
-    """
-    enc       = node.attrib.get("format", "ascii").lower()
-    vtk_type  = node.attrib.get("type", "Float32")
-    dtype     = _VTK_DTYPE.get(vtk_type, np.float32)
+# ── A) ASCII DataArray 파서 ───────────────────────────────
+def _read_dataarray_ascii(node: ET.Element) -> np.ndarray:
+    """ASCII format DataArray → float64 ndarray."""
     text_data = (node.text or "").strip()
+    if not text_data:
+        return np.array([], dtype=np.float64)
+    try:
+        return np.array(text_data.split(), dtype=np.float64)
+    except ValueError:
+        return np.array([], dtype=np.float64)
 
-    if enc == "ascii":
-        if not text_data:
-            return np.array([], dtype=np.float64)
-        try:
-            return np.array(text_data.split(), dtype=np.float64)
-        except ValueError:
-            return np.array([], dtype=np.float64)
+# ── B) Appended+Base64+ZLib 파서 ─────────────────────────
+def _parse_appended_block(b64_stream: bytes, char_offset: int,
+                           header_type: str = "UInt32") -> bytes:
+    """
+    VTK appended base64+zlib 블록을 압축 해제해 raw bytes 반환.
 
-    elif enc == "binary":
-        # VTK binary inline: base64(header_bytes + data_bytes)
-        # header_type='UInt32' → 4 bytes, 'UInt64' → 8 bytes
-        if not text_data:
-            return np.array([], dtype=np.float64)
+    VTK 파일 구조:
+      <AppendedData encoding="base64">
+        _[헤더서브블록==[데이터서브블록][헤더==[데이터]][...]
+      </AppendedData>
+
+    각 DataArray는 b64_stream 내 offset 위치에:
+      - 헤더 서브블록 (== 패딩 포함): n_blocks, uncomp_sz, last_sz, comp_sizes[n]
+      - 데이터 서브블록: zlib 압축 청크들
+
+    헤더와 데이터가 같은 서브블록에 있는 경우(offset 0 등)도 처리.
+    """
+    hsz  = 4 if header_type == "UInt32" else 8
+    hfmt = "<I" if header_type == "UInt32" else "<Q"
+
+    # 헤더 서브블록: char_offset 부터 다음 '==' 까지
+    eq_pos = b64_stream.find(b"==", char_offset)
+    if eq_pos == -1:
+        raise ValueError(f"헤더 블록 끝(==)을 찾을 수 없음 (offset={char_offset})")
+    hdr_end = eq_pos + 2
+    hdr_raw = base64.b64decode(b64_stream[char_offset:hdr_end])
+
+    # 헤더 파싱
+    n_blocks   = struct.unpack_from(hfmt, hdr_raw, 0)[0]
+    comp_sizes = [struct.unpack_from(hfmt, hdr_raw, (3 + i) * hsz)[0]
+                  for i in range(n_blocks)]
+    total_comp = sum(comp_sizes)
+    hbytes     = (3 + n_blocks) * hsz
+
+    # 데이터 위치 결정
+    if len(hdr_raw) > hbytes:
+        # 헤더와 데이터가 같은 서브블록 (offset=0 패턴)
+        data_bytes = hdr_raw[hbytes:]
+    else:
+        # 데이터가 바로 다음 서브블록
+        data_start  = hdr_end
+        needed_chars = ((total_comp + 2) // 3) * 4
+        chunk = b64_stream[data_start:data_start + needed_chars]
+        pad   = (4 - len(chunk) % 4) % 4
+        data_bytes = base64.b64decode(chunk + b"=" * pad)
+
+    # zlib 해제
+    pos, out = 0, b""
+    for cs in comp_sizes:
+        out += zlib.decompress(data_bytes[pos:pos + cs])
+        pos += cs
+    return out
+
+
+def _parse_vtu_appended(raw_bytes: bytes, material: str,
+                         rho: float) -> pd.DataFrame:
+    """Appended+Base64+ZLib VTU → DataFrame."""
+    text = raw_bytes.decode("utf-8", errors="replace")
+
+    # AppendedData 스트림 추출
+    app_start  = raw_bytes.find(b"<AppendedData")
+    section    = raw_bytes[app_start:]
+    underscore = section.find(b"_")
+    end_tag    = section.find(b"<", underscore)
+    b64_stream = section[underscore + 1:end_tag].strip()
+
+    # header_type / mesh 크기
+    ht_m   = re.search(r'header_type=["\'](\w+)["\']', text)
+    htype  = ht_m.group(1) if ht_m else "UInt32"
+    npts_m = re.search(r'NumberOfPoints=["\'](\d+)["\']', text)
+    ncls_m = re.search(r'NumberOfCells=["\'](\d+)["\']', text)
+    n_pts  = int(npts_m.group(1)) if npts_m else 0
+    n_cells= int(ncls_m.group(1)) if ncls_m else 0
+
+    dtmap = {"Float32": "<f4", "Float64": "<f8",
+             "Int64": "<i8", "Int32": "<i4", "UInt8": "u1"}
+
+    # DataArray 메타데이터 수집
+    das = {}
+    for m in re.finditer(r"<DataArray([^/]+?)/?>\s*", text):
+        tag = m.group(1)
+        nm  = re.search(r'Name=["\']([^"\']+)', tag)
+        off = re.search(r'offset=["\'](\d+)',   tag)
+        tp  = re.search(r' type=["\'](\w+)',    tag)
+        nc  = re.search(r'NumberOfComponents=["\'](\d+)', tag)
+        if nm and off:
+            das[nm.group(1)] = {
+                "offset": int(off.group(1)),
+                "type":   tp.group(1) if tp else "Float32",
+                "nc":     int(nc.group(1)) if nc else 1,
+            }
+
+    # 각 DataArray 해제
+    arrays = {}
+    for name, info in das.items():
+        if name in ("connectivity", "offsets", "types"):
+            continue  # 위상 데이터는 시각화 불필요
         try:
-            # base64 패딩 보정
-            padded = text_data + "=" * ((-len(text_data)) % 4)
-            raw = base64.b64decode(padded)
-            # VTKFile header_type 속성 확인 (부모 루트에서 전달 불가 → 둘 다 시도)
-            for header_bytes in (8, 4):  # UInt64 먼저, 실패 시 UInt32
-                try:
-                    data_raw = raw[header_bytes:]
-                    arr = np.frombuffer(data_raw, dtype=dtype)
-                    if len(arr) > 0:
-                        return arr.astype(np.float64)
-                except Exception:
-                    continue
-            return np.array([], dtype=np.float64)
+            raw_out = _parse_appended_block(b64_stream, info["offset"], htype)
+            dtype   = dtmap.get(info["type"], "<f4")
+            arr     = np.frombuffer(raw_out, dtype=dtype).astype(np.float64)
+            nc      = info["nc"]
+            if nc == 3:
+                arr3 = arr.reshape(-1, 3)
+                if name == "Points":
+                    arrays["_pts"] = arr3
+                else:
+                    arrays[name + "_mag"] = np.linalg.norm(arr3, axis=1)
+            else:
+                arrays[name] = arr
         except Exception:
-            return np.array([], dtype=np.float64)
+            pass
 
-    # appended 방식은 별도 처리 필요 → 빈 배열 반환 (현재 미지원)
-    return np.array([], dtype=np.float64)
+    # 좌표 처리
+    pts = arrays.pop("_pts", None)
+    if pts is None:
+        raise ValueError("VTU: Points 데이터를 파싱할 수 없습니다.")
+
+    # CellData vs PointData 판별 및 매핑
+    # pts: (n_pts, 3), celldata: (n_cells,)
+    # pts_per_cell = n_pts / n_cells (정수배인 경우 셀 중심점 계산)
+    result = {}
+    pts_per_cell = round(n_pts / n_cells) if n_cells > 0 else 1
+    use_cells = (n_cells > 0 and pts_per_cell >= 1
+                 and abs(pts_per_cell * n_cells - n_pts) < n_cells)
+
+    if use_cells:
+        # 셀 중심점 (포인트를 셀 단위로 그룹화)
+        n_use      = n_cells * pts_per_cell
+        centroids  = pts[:n_use].reshape(n_cells, pts_per_cell, 3).mean(axis=1)
+        result.update({"x": centroids[:, 0],
+                       "y": centroids[:, 1],
+                       "z": centroids[:, 2]})
+        n_ref = n_cells
+    else:
+        result.update({"x": pts[:, 0], "y": pts[:, 1], "z": pts[:, 2]})
+        n_ref = n_pts
+
+    for name, arr in arrays.items():
+        trimmed = arr[:n_ref]
+        if len(trimmed) == n_ref:
+            result[name] = trimmed
+
+    df = pd.DataFrame(result)
+
+    # ── 단위 변환 ──────────────────────────────────────────
+    # flow_distance [0=gate, 1=end] → 압력·충진시간·온도 근사
+    if "flow_distance" in df.columns:
+        fd = df["flow_distance"].to_numpy(float)
+        if "pressure" not in df.columns:
+            df["pressure"]    = np.clip((1.0 - fd) * 3.0, 0.0, None)  # gate 최대압
+        if "fill_time" not in df.columns:
+            df["fill_time"]   = fd
+        if "temperature" not in df.columns:
+            df["temperature"] = 40.0 + (1.0 - fd) * 145.0   # gate=185°C, end=40°C
+    elif "p" in df.columns:
+        pv = np.abs(df["p"].to_numpy(float) * rho / 1e6)
+        df["pressure"] = pv
+
+    if "pressure" not in df.columns:
+        df["pressure"] = 0.0
+    if "temperature" not in df.columns:
+        df["temperature"] = 100.0
+    if "fill_time" not in df.columns:
+        pv    = df["pressure"].to_numpy(float)
+        pspan = float(pv.max() - pv.min())
+        df["fill_time"] = (pv.max() - pv) / pspan if pspan > 1e-9 \
+                          else np.linspace(0.0, 1.0, len(df))
+
+    df["material"] = material
+    return df
 
 
-def _build_df_from_piece(piece: ET.Element, n_pts: int, rho: float,
-                          material: str) -> pd.DataFrame:
-    """Piece 노드에서 좌표 + PointData → DataFrame 생성."""
-    # ── 좌표 ─────────────────────────────────────────────
+# ── A) ASCII VTU 파서 ────────────────────────────────────
+def _parse_vtu_ascii(raw_bytes: bytes, material: str,
+                      rho: float) -> pd.DataFrame:
+    """ASCII format VTU → DataFrame."""
+    text = _vtk_clean_xml(raw_bytes.decode("utf-8", errors="replace"))
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"VTU XML 파싱 실패: {e}")
+
+    piece = root.find(".//Piece")
+    if piece is None:
+        raise ValueError("VTU: <Piece> 태그 없음")
+    n_pts = int(piece.attrib.get("NumberOfPoints", 0))
+    if n_pts == 0:
+        raise ValueError("VTU: NumberOfPoints=0")
+
     pts_node = piece.find(".//Points/DataArray")
     if pts_node is None:
         raise ValueError("VTU: Points/DataArray 없음")
-
-    pts_flat = _read_dataarray(pts_node)
-    need = n_pts * 3
-    if len(pts_flat) < need:
+    pts_flat = _read_dataarray_ascii(pts_node)
+    if len(pts_flat) < n_pts * 3:
         raise ValueError(
-            f"VTU: 좌표 데이터 부족 ({len(pts_flat)} < {need}).\n"
-            f"힌트: binary 형식 파일은 foamToVTK -ascii 로 재변환하거나 "
-            f"단일 internal.vtu 파일을 직접 업로드하세요."
-        )
-    coords = pts_flat[:need].reshape(-1, 3)
+            f"VTU: 좌표 데이터 부족 ({len(pts_flat)} < {n_pts * 3})")
+    coords = pts_flat[:n_pts * 3].reshape(-1, 3)
     result: dict = {
         "x": coords[:, 0].astype(float),
         "y": coords[:, 1].astype(float),
         "z": coords[:, 2].astype(float),
     }
 
-    # ── PointData 필드 (p, U, T, alpha.water 등) ─────────
     for da in piece.findall(".//PointData/DataArray"):
         name = da.attrib.get("Name", "").strip()
         nc   = int(da.attrib.get("NumberOfComponents", "1"))
-        arr  = _read_dataarray(da)
+        arr  = _read_dataarray_ascii(da)
         try:
             if nc == 1 and len(arr) >= n_pts:
                 result[name] = arr[:n_pts].astype(float)
@@ -124,76 +270,63 @@ def _build_df_from_piece(piece: ET.Element, n_pts: int, rho: float,
 
     df = pd.DataFrame(result)
 
-    # ── 단위 변환 ─────────────────────────────────────────
-    # OpenFOAM kinematic pressure p [m²/s²] → 물리 압력 [MPa]
     if "p" in df.columns:
-        p_kin  = df["p"].to_numpy(dtype=float)
+        p_kin  = df["p"].to_numpy(float)
         p_pa   = p_kin * rho
         p_mpa  = p_pa / 1e6
         span   = float(p_mpa.max()) - float(p_mpa.min())
-        span_pa= float(p_pa.max())  - float(p_pa.min())
-        if span < 1e-4 and span_pa > 0:
-            p_mpa = p_pa / 1e3   # kPa 대체 (스케일이 너무 작을 때)
+        if span < 1e-4:
+            p_mpa = p_pa / 1e3
         df["pressure"] = np.abs(p_mpa)
     elif "pressure" not in df.columns:
         df["pressure"] = 0.0
 
-    # 온도
     if "T" in df.columns:
-        df["temperature"] = df["T"].to_numpy(dtype=float)
+        df["temperature"] = df["T"].to_numpy(float)
     elif "temperature" not in df.columns:
         if "U_mag" in df.columns:
-            uv    = df["U_mag"].to_numpy(dtype=float)
-            u_min = float(uv.min()); u_max = float(uv.max())
-            denom = (u_max - u_min) if (u_max - u_min) > 1e-9 else 1.0
-            df["temperature"] = 40.0 + (uv - u_min) / denom * 145.0
+            uv    = df["U_mag"].to_numpy(float)
+            denom = float(uv.max() - uv.min())
+            df["temperature"] = 40.0 + (uv - uv.min()) / (denom or 1.0) * 145.0
         else:
             df["temperature"] = 100.0
 
-    # 충진 시간 (압력 높을수록 gate에 가까움 → fill_time 낮음)
     if "fill_time" not in df.columns:
-        pv    = df["pressure"].to_numpy(dtype=float)
-        p_min = float(pv.min()); p_max = float(pv.max())
-        span  = p_max - p_min
-        df["fill_time"] = (p_max - pv) / span if span > 1e-9 else np.linspace(0.0, 1.0, len(df))
+        pv    = df["pressure"].to_numpy(float)
+        pspan = float(pv.max() - pv.min())
+        df["fill_time"] = (pv.max() - pv) / pspan if pspan > 1e-9 \
+                          else np.linspace(0.0, 1.0, len(df))
 
     df["material"] = material
     return df
 
 
+# ── 통합 파서 (외부에서 호출하는 메인 함수) ──────────────
 def parse_vtu_to_dataframe(file_bytes: bytes, material: str = "17-4PH",
                             rho: float = 7780.0) -> pd.DataFrame:
     """
-    OpenFOAM .vtu 파일(ASCII/Binary) → CAE DataFrame.
-    반환 컬럼: x, y, z, pressure(MPa), temperature(°C),
-               fill_time(s), U_mag, Ux, Uy, Uz, material
+    VTU 파일 자동 감지 파서.
+    - Appended+Base64+ZLib (MIM-Ops GitHub Actions 출력) → _parse_vtu_appended
+    - ASCII format (foamToVTK -ascii 출력)               → _parse_vtu_ascii
     """
-    text = file_bytes.decode("utf-8", errors="replace")
-    text = _vtk_clean_xml(text)
-    try:
-        root = ET.fromstring(text)
-    except ET.ParseError as e:
-        raise ValueError(f"VTU XML 파싱 실패: {e}")
-
-    piece = root.find(".//Piece")
-    if piece is None:
-        raise ValueError("VTU: <Piece> 태그 없음")
-    n_pts = int(piece.attrib.get("NumberOfPoints", 0))
-    if n_pts == 0:
-        raise ValueError("VTU: NumberOfPoints=0 — 빈 메쉬")
-
-    return _build_df_from_piece(piece, n_pts, rho, material)
+    # Appended 방식 감지
+    if b"AppendedData" in file_bytes:
+        try:
+            return _parse_vtu_appended(file_bytes, material=material, rho=rho)
+        except Exception as e:
+            raise ValueError(f"VTU(Appended) 파싱 실패: {e}")
+    else:
+        try:
+            return _parse_vtu_ascii(file_bytes, material=material, rho=rho)
+        except Exception as e:
+            raise ValueError(f"VTU(ASCII) 파싱 실패: {e}")
 
 
 def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH",
                                 rho: float = 7780.0) -> pd.DataFrame:
     """
-    ZIP 파일 안의 VTK 결과를 DataFrame으로 변환.
-    우선순위:
-      1. .vtm 파일의 DataSet file= 참조를 따라 internal.vtu 찾기
-      2. ZIP 내 'internal'이 포함된 .vtu
-      3. ZIP 내 가장 큰 .vtu (가장 많은 데이터)
-    각 파일은 ASCII → Binary 순으로 파싱 시도.
+    ZIP 파일 → VTU 파싱.
+    우선순위: .vtm DataSet 참조 → 'internal' 포함 .vtu → 가장 큰 .vtu
     """
     buf = io.BytesIO(zip_bytes)
     if not zipfile.is_zipfile(buf):
@@ -202,65 +335,50 @@ def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH",
     with zipfile.ZipFile(buf) as z:
         names = z.namelist()
 
-        # 전략 1: .vtm 파일이 있으면 DataSet file= 경로로 추적
-        vtm_files = [n for n in names if n.lower().endswith(".vtm")]
+        # 전략 1: .vtm → DataSet file= 추적
         vtu_candidate = None
-        for vtm_path in vtm_files:
+        for vtm_path in [n for n in names if n.lower().endswith(".vtm")]:
             try:
-                vtm_text = _vtk_clean_xml(z.read(vtm_path).decode("utf-8", errors="replace"))
+                vtm_text = _vtk_clean_xml(
+                    z.read(vtm_path).decode("utf-8", errors="replace"))
                 vtm_root = ET.fromstring(vtm_text)
                 for ds in vtm_root.findall(".//DataSet"):
                     ref = ds.attrib.get("file", "")
                     if "internal" in ref.lower() and ref.lower().endswith(".vtu"):
-                        # 절대경로 또는 상대경로 처리
                         base_dir = os.path.dirname(vtm_path)
-                        candidate = os.path.join(base_dir, ref).replace("\\", "/")
-                        # ZIP 내 파일 존재 여부 확인
-                        if candidate in names:
-                            vtu_candidate = candidate
-                            break
-                        # 경로 구분자 차이 보정
                         for n in names:
-                            if n.endswith(ref) or n.endswith(os.path.basename(ref)):
-                                vtu_candidate = n
-                                break
+                            if n.endswith(os.path.basename(ref)):
+                                vtu_candidate = n; break
             except Exception:
                 continue
             if vtu_candidate:
                 break
 
-        # 전략 2: internal 포함 .vtu 직접 검색
+        # 전략 2: internal 포함 .vtu
         all_vtu = [n for n in names if n.lower().endswith(".vtu")]
         if not vtu_candidate:
-            internal_vtu = [n for n in all_vtu if "internal" in n.lower()]
-            if internal_vtu:
-                # 마지막 타임스텝(숫자 기준 정렬)
-                vtu_candidate = sorted(internal_vtu)[-1]
+            internals = [n for n in all_vtu if "internal" in n.lower()]
+            vtu_candidate = sorted(internals)[-1] if internals else None
 
-        # 전략 3: 가장 큰 .vtu (데이터가 가장 풍부)
+        # 전략 3: 가장 큰 .vtu
         if not vtu_candidate and all_vtu:
             vtu_candidate = max(all_vtu, key=lambda n: z.getinfo(n).file_size)
 
         if not vtu_candidate:
             raise FileNotFoundError(
                 "ZIP 내에 .vtu 파일이 없습니다.\n"
-                "foamToVTK 실행 후 VTK/ 폴더를 ZIP으로 압축해 업로드하세요."
-            )
+                "foamToVTK 실행 후 VTK/ 폴더를 ZIP 압축해 업로드하세요.")
 
         vtu_bytes = z.read(vtu_candidate)
 
-    # 선택된 파일 파싱 (ASCII 우선, 실패 시 오류 메시지 상세화)
     try:
         df = parse_vtu_to_dataframe(vtu_bytes, material=material, rho=rho)
         df.attrs["source_file"] = vtu_candidate
         return df
     except ValueError as e:
         raise ValueError(
-            f"VTU 파싱 실패 ({os.path.basename(vtu_candidate)}): {e}\n\n"
-            "📌 해결 방법:\n"
-            "  1. foamToVTK -ascii 로 재실행 후 VTK/ 폴더를 ZIP 압축\n"
-            "  2. 또는 internal.vtu 파일만 직접 업로드"
-        )
+            f"{os.path.basename(vtu_candidate)}: {e}\n\n"
+            "📌 해결: internal.vtu 파일만 단독으로 업로드해 보세요.")
 
 # ── 경로 설정 ──────────────────────────────────────────────
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -857,8 +975,13 @@ elif current_stage == "stage1":
                     """GitHub API로 artifacts 목록 직접 조회 (flow_csv_generator 미의존)."""
                     try:
                         token = st.secrets["GITHUB_TOKEN"]
-                        owner = st.secrets.get("OPENFOAM_REPO_OWNER", "workshopcompany")
-                        repo  = st.secrets.get("OPENFOAM_REPO_NAME",  "OpenFOAM-Injection-Automation")
+                        # 키 이름: REPO_OWNER 또는 OPENFOAM_REPO_OWNER 둘 다 지원
+                        owner = (st.secrets.get("REPO_OWNER")
+                                 or st.secrets.get("OPENFOAM_REPO_OWNER")
+                                 or "workshopcompany")
+                        repo  = (st.secrets.get("REPO_NAME")
+                                 or st.secrets.get("OPENFOAM_REPO_NAME")
+                                 or "OpenFOAM-Injection-Automation")
                     except (KeyError, FileNotFoundError):
                         raise RuntimeError("GITHUB_TOKEN이 Secrets에 없습니다.")
                     url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
