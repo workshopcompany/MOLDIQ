@@ -991,50 +991,74 @@ elif current_stage == "stage1":
             # ── 진단 버튼 ──────────────────────────────────────────
             if st.button("🔍 아티팩트 목록 확인", help="GitHub에서 실제 아티팩트 목록을 가져와 Signal ID를 직접 확인합니다"):
 
-                def _fetch_artifacts_direct(per_page: int = 20) -> list:
-                    """GitHub API로 artifacts 목록 직접 조회 (flow_csv_generator 미의존)."""
+                def _fetch_artifacts_direct(per_page: int = 50) -> list:
+                    """GitHub API로 artifacts 목록 직접 조회."""
                     try:
+                        # 1. 토큰 및 설정 로드
                         token = st.secrets["GITHUB_TOKEN"]
-                        # 키 이름: REPO_OWNER 또는 OPENFOAM_REPO_OWNER 둘 다 지원
-                        owner = (st.secrets.get("REPO_OWNER")
-                                 or st.secrets.get("OPENFOAM_REPO_OWNER")
-                                 or "workshopcompany")
-                        repo  = (st.secrets.get("REPO_NAME")
-                                 or st.secrets.get("OPENFOAM_REPO_NAME")
-                                 or "OpenFOAM-Injection-Automation")
+                        
+                        # 요청하신대로 workshopcompany와 해당 레포지토리로 설정
+                        # secrets에 설정값이 있으면 그것을 쓰고, 없으면 기본값(workshopcompany)을 사용합니다.
+                        owner = st.secrets.get("REPO_OWNER") or "workshopcompany"
+                        repo  = st.secrets.get("REPO_NAME") or "openfoam-injection-automation"
+                        
                     except (KeyError, FileNotFoundError):
-                        raise RuntimeError("GITHUB_TOKEN이 Secrets에 없습니다.")
-                    url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
-                    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-                    resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=10)
-                    if resp.status_code == 401:
-                        raise RuntimeError("GITHUB_TOKEN이 유효하지 않습니다 (401 Unauthorized).")
-                    if resp.status_code == 404:
-                        raise RuntimeError(f"저장소를 찾을 수 없습니다: {owner}/{repo} (404)")
-                    resp.raise_for_status()
-                    return resp.json().get("artifacts", [])
+                        raise RuntimeError("GITHUB_TOKEN이 .streamlit/secrets.toml에 없습니다.")
 
-                if not _check_github_secrets():
+                    # 2. GitHub API 호출 (최신순 조회를 위해 per_page 상향)
+                    url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
+                    headers = {
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28"
+                    }
+                    
+                    try:
+                        # 최신 아티팩트를 먼저 확인하기 위해 쿼리 매개변수 확인
+                        resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=10)
+                        
+                        if resp.status_code == 401:
+                            raise RuntimeError("GITHUB_TOKEN이 유효하지 않거나 권한이 없습니다 (401).")
+                        if resp.status_code == 404:
+                            raise RuntimeError(f"저장소를 찾을 수 없습니다: {owner}/{repo} (404)")
+                        
+                        resp.raise_for_status()
+                        return resp.json().get("artifacts", [])
+                    except requests.exceptions.RequestException as e:
+                        raise RuntimeError(f"GitHub 연결 실패: {str(e)}")
+
+                # --- 버튼 클릭 시 실행 로직 ---
+                if not _check_github_secrets(): # 기존 코드에 있는 체크 함수 호출
                     _show_github_token_guide()
                 else:
                     try:
-                        with st.spinner("GitHub에서 목록 가져오는 중..."):
-                            artifacts = _fetch_artifacts_direct(per_page=20)
+                        with st.spinner("GitHub에서 시뮬레이션 결과 목록을 가져오는 중..."):
+                            artifacts = _fetch_artifacts_direct(per_page=30)
+                        
                         if artifacts:
-                            st.success(f"✅ {len(artifacts)}개 아티팩트 발견 — 숫자 ID 또는 이름 전체를 Signal ID에 입력하세요")
-                            st.dataframe([{
-                                "아티팩트 이름": a["name"],
-                                "생성일":        a["created_at"][:10],
-                                "크기(MB)":      f"{a.get('size_in_bytes',0)/1024/1024:.1f}",
-                                "만료일":        a.get("expires_at", "")[:10],
-                            } for a in artifacts], use_container_width=True, hide_index=True)
+                            st.success(f"✅ {len(artifacts)}개의 시뮬레이션 결과 발견")
+                            st.info("아래 목록의 '아티팩트 이름'에서 'simulation-' 뒤의 문구(예: cf22322a)를 Signal ID에 입력하세요.")
+                            
+                            # 사용자에게 보여줄 데이터 프레임 구성
+                            display_data = []
+                            for a in artifacts:
+                                # 'simulation-'으로 시작하는 파일만 필터링하거나 강조할 수 있습니다.
+                                display_data.append({
+                                    "아티팩트 이름": a["name"],
+                                    "생성일": a["created_at"].replace("T", " ").replace("Z", ""),
+                                    "크기(MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
+                                    "상태": "사용 가능" if not a.get("expired") else "만료됨"
+                                })
+                            
+                            st.dataframe(display_data, use_container_width=True, hide_index=True)
                         else:
-                            st.warning("⚠️ 아티팩트가 없습니다. MIM-Ops에서 시뮬레이션을 먼저 실행하세요.")
+                            st.warning("⚠️ 아티팩트가 없습니다. GitHub Actions에서 시뮬레이션이 완료되었는지 확인하세요.")
+                            
                     except RuntimeError as e:
                         st.error(str(e))
                         _show_github_token_guide()
                     except Exception as e:
-                        st.error(f"❌ GitHub API 오류: {e}")
+                        st.error(f"❌ 예상치 못한 오류: {e}")
 
             st.divider()
 
