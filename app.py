@@ -1431,159 +1431,181 @@ elif current_stage == "stage1":
             # flow_weight 컬럼 존재 = solver 실좌표 데이터 → Cell Mesh 렌더링 가능
             _has_voxel_data = "flow_weight" in cae_df.columns
 
-            # ══ Cell Mesh 빌더 — CAE 포인트 → 채워진 사각형 셀 Mesh3d ══════
-            def _build_cell_mesh(df_in, field_col, max_pts=6000):
+            # ══ Cell Mesh 빌더 — CAE 포인트 → 진짜 3D 솔리드 셀 Mesh3d ═══
+            def _build_cell_mesh(df_in, field_col, max_pts=8000):
                 """
-                CAE 포인트 클라우드 → Moldflow 스타일 채워진 셀 메쉬.
+                CAE 포인트 클라우드 → 진짜 3D 솔리드 셀 메쉬 (Moldflow 스타일).
 
-                전략:
-                  1) XY 격자 빈(bin)을 생성 (약 sqrt(N) × sqrt(N))
-                  2) 각 빈에 포인트가 있으면 셀 중앙에 값 배정 (IDW 평균)
-                  3) 인접 빈 4개씩 묶어 두 개의 삼각형(quad → 2 tris)으로 Mesh3d 구성
-                  4) 결과: 각 셀이 독립된 색상을 가진 채워진 패치
+                핵심 전략:
+                  XYZ 3차원 격자(voxel grid)를 생성.
+                  데이터가 있는 voxel만 추출 → 각 voxel의 6개 면(quad→2tri)으로
+                  Mesh3d 구성 → 각 face가 독립된 필드 색상을 가진 솔리드 덩어리.
 
-                Returns: dict with keys x, y, z, i, j, k, intensity
+                Z 범위가 매우 얇으면(판형) XY 격자 + 위/아래 두 면으로 두께를 주어
+                납작한 2D 처럼 보이지 않게 처리.
                 """
                 _df = df_in.copy()
-                n = len(_df)
-                if n == 0:
+                if len(_df) == 0:
                     return None
 
-                # 다운샘플 (과다 포인트)
-                if n > max_pts:
-                    _step = max(1, n // max_pts)
-                    _df = _df.iloc[::_step].reset_index(drop=True)
-
+                # ── 좌표 추출 ─────────────────────────────────────────────
                 x_arr = _df["x"].values.astype(float)
                 y_arr = _df["y"].values.astype(float)
-                z_arr = _df["z"].values.astype(float) if "z" in _df.columns else np.zeros(len(_df))
+                has_z = "z" in _df.columns
+                z_arr = _df["z"].values.astype(float) if has_z else np.zeros(len(_df))
                 v_arr = _df[field_col].values.astype(float)
 
-                # 격자 크기 결정 (포인트 수의 제곱근 기준, 최소 20 × 20)
-                n_grid = max(20, int(np.sqrt(len(_df)) * 1.2))
-                n_grid = min(n_grid, 80)  # 최대 80×80 = 6400셀 (브라우저 부담)
+                # Z 범위 확인 — 너무 얇으면 인위적으로 두께 부여
+                z_range = float(z_arr.max() - z_arr.min())
+                xy_range = max(float(x_arr.max() - x_arr.min()),
+                               float(y_arr.max() - y_arr.min()), 1e-6)
+                _flat = z_range < xy_range * 0.05   # XY 대비 5% 미만이면 "납작"
 
-                x_bins = np.linspace(x_arr.min(), x_arr.max(), n_grid + 1)
-                y_bins = np.linspace(y_arr.min(), y_arr.max(), n_grid + 1)
+                if _flat:
+                    # Z가 없거나 너무 얇음 → 인위적으로 두께 추가
+                    z_mid  = float(z_arr.mean())
+                    z_half = xy_range * 0.04          # XY 대비 4% 두께
+                    z_arr  = np.where(z_arr <= z_mid, z_mid - z_half, z_mid + z_half)
 
-                # 각 포인트가 속하는 빈 인덱스
-                xi = np.digitize(x_arr, x_bins) - 1
-                yi = np.digitize(y_arr, y_bins) - 1
-                xi = np.clip(xi, 0, n_grid - 1)
-                yi = np.clip(yi, 0, n_grid - 1)
+                # ── 3D 격자 해상도 결정 ────────────────────────────────────
+                # 총 voxel 수 ≤ max_pts 가 되도록 nx, ny, nz 배분
+                x_span = float(x_arr.max() - x_arr.min()) or 1.0
+                y_span = float(y_arr.max() - y_arr.min()) or 1.0
+                z_span = float(z_arr.max() - z_arr.min()) or 1.0
 
-                # 격자별 평균값 계산
-                cell_val = np.full((n_grid, n_grid), np.nan)
-                cell_z   = np.full((n_grid, n_grid), 0.0)
-                cell_cnt = np.zeros((n_grid, n_grid), dtype=int)
+                # 비례 배분
+                vol_cbrt = (max_pts) ** (1/3)
+                scale = (x_span * y_span * z_span) ** (1/3) or 1.0
+                nx = max(4, int(vol_cbrt * x_span / scale))
+                ny = max(4, int(vol_cbrt * y_span / scale))
+                nz = max(2, int(vol_cbrt * z_span / scale))
+                # 너무 커지지 않게 클램프
+                nx = min(nx, 60); ny = min(ny, 60); nz = min(nz, 20)
 
+                x_bins = np.linspace(x_arr.min(), x_arr.max(), nx + 1)
+                y_bins = np.linspace(y_arr.min(), y_arr.max(), ny + 1)
+                z_bins = np.linspace(z_arr.min(), z_arr.max(), nz + 1)
+
+                # ── 각 포인트를 voxel에 배정 ──────────────────────────────
+                xi = np.clip(np.digitize(x_arr, x_bins) - 1, 0, nx - 1)
+                yi = np.clip(np.digitize(y_arr, y_bins) - 1, 0, ny - 1)
+                zi = np.clip(np.digitize(z_arr, z_bins) - 1, 0, nz - 1)
+
+                vox_val = np.full((nx, ny, nz), np.nan)
+                vox_cnt = np.zeros((nx, ny, nz), dtype=int)
                 for idx in range(len(_df)):
-                    ii, jj = xi[idx], yi[idx]
-                    if np.isnan(cell_val[ii, jj]):
-                        cell_val[ii, jj] = v_arr[idx]
-                        cell_z[ii, jj]   = z_arr[idx]
+                    ii, jj, kk = xi[idx], yi[idx], zi[idx]
+                    if np.isnan(vox_val[ii, jj, kk]):
+                        vox_val[ii, jj, kk] = v_arr[idx]
                     else:
-                        cell_val[ii, jj] += v_arr[idx]
-                        cell_z[ii, jj]   += z_arr[idx]
-                    cell_cnt[ii, jj] += 1
+                        vox_val[ii, jj, kk] += v_arr[idx]
+                    vox_cnt[ii, jj, kk] += 1
 
-                mask = cell_cnt > 0
-                cell_val[mask] /= cell_cnt[mask]
-                cell_z[mask]   /= cell_cnt[mask]
+                filled = vox_cnt > 0
+                vox_val[filled] /= vox_cnt[filled]
 
-                # 빈 셀 이웃 보간 (numpy only, 최대 4회 반복)
-                if (~mask).any() and mask.any():
-                    for _ in range(4):
-                        still_empty = np.isnan(cell_val)
-                        if not still_empty.any():
-                            break
-                        padded  = np.pad(cell_val, 1, constant_values=np.nan)
-                        zpadded = np.pad(cell_z,   1, constant_values=0.0)
-                        n_sum   = np.zeros((n_grid, n_grid))
-                        n_cnt   = np.zeros((n_grid, n_grid))
-                        zn_sum  = np.zeros((n_grid, n_grid))
-                        for di in range(3):
-                            for dj in range(3):
-                                if di == 1 and dj == 1:
+                # 빈 voxel 이웃 보간 (최대 3회, 26-이웃 vectorized)
+                for _ in range(3):
+                    empty = np.isnan(vox_val)
+                    if not empty.any():
+                        break
+                    pad = np.pad(vox_val, 1, constant_values=np.nan)
+                    s_sum = np.zeros((nx, ny, nz))
+                    s_cnt = np.zeros((nx, ny, nz))
+                    for di in range(3):
+                        for dj in range(3):
+                            for dk in range(3):
+                                if di == 1 and dj == 1 and dk == 1:
                                     continue
-                                sl  = padded [di:di+n_grid, dj:dj+n_grid]
-                                zsl = zpadded[di:di+n_grid, dj:dj+n_grid]
+                                sl = pad[di:di+nx, dj:dj+ny, dk:dk+nz]
                                 valid = ~np.isnan(sl)
-                                n_sum  += np.where(valid, sl,  0)
-                                zn_sum += np.where(valid, zsl, 0)
-                                n_cnt  += valid.astype(float)
-                        fill_mask = still_empty & (n_cnt > 0)
-                        cell_val[fill_mask] = n_sum[fill_mask] / n_cnt[fill_mask]
-                        cell_z[fill_mask]   = zn_sum[fill_mask] / n_cnt[fill_mask]
+                                s_sum += np.where(valid, sl, 0)
+                                s_cnt += valid.astype(float)
+                    fm = empty & (s_cnt > 0)
+                    vox_val[fm] = s_sum[fm] / s_cnt[fm]
 
-                # 셀 중앙 좌표 계산
-                x_centers = (x_bins[:-1] + x_bins[1:]) / 2  # (n_grid,)
-                y_centers = (y_bins[:-1] + y_bins[1:]) / 2  # (n_grid,)
+                # ── Voxel 면(face) → Mesh3d 삼각형 생성 ──────────────────
+                # 각 채워진 voxel의 6면 중 "외부 노출면"만 추출
+                # (이웃 voxel이 비어있거나 경계인 면)
+                # 성능을 위해 모든 면 포함 (중복 감수)
+                tri_vx, tri_vy, tri_vz = [], [], []   # vertex coords
+                face_val_list = []
 
-                # Mesh3d용 vertex / face 배열 구성
-                # vertex: 셀 코너 (n_grid+1) × (n_grid+1) 격자
-                # face: 각 셀 → 2 삼각형
-                nx1, ny1 = n_grid + 1, n_grid + 1
-                vert_x = np.repeat(x_bins, ny1)
-                vert_y = np.tile(y_bins, nx1)
-                vert_z = np.zeros(nx1 * ny1)
+                # 8 코너의 로컬 오프셋 (unit cube)
+                cx = (x_bins[:-1] + x_bins[1:]) / 2
+                cy = (y_bins[:-1] + y_bins[1:]) / 2
+                cz = (z_bins[:-1] + z_bins[1:]) / 2
+                dx2 = (x_bins[1] - x_bins[0]) / 2
+                dy2 = (y_bins[1] - y_bins[0]) / 2
+                dz2 = (z_bins[1] - z_bins[0]) / 2
 
-                # 각 코너의 값: 해당 코너를 공유하는 셀 값의 평균
-                vert_val = np.full(nx1 * ny1, np.nan)
-                for ii in range(n_grid):
-                    for jj in range(n_grid):
-                        v = cell_val[ii, jj]
-                        if np.isnan(v):
-                            continue
-                        z_v = cell_z[ii, jj]
-                        corners = [
-                            ii * ny1 + jj,
-                            ii * ny1 + jj + 1,
-                            (ii + 1) * ny1 + jj,
-                            (ii + 1) * ny1 + jj + 1,
-                        ]
-                        for c in corners:
-                            if np.isnan(vert_val[c]):
-                                vert_val[c] = v
-                            else:
-                                vert_val[c] = (vert_val[c] + v) / 2
-                            # Z는 셀 중앙값 사용
-                            vert_z[c] = z_v
+                # 6면의 4코너 오프셋 정의 (±dx2, ±dy2, ±dz2)
+                # 각 면은 quad → 2 tri
+                face_defs = [
+                    # (normal_axis, offsets for 4 corners)
+                    # +X face
+                    [( dx2,-dy2,-dz2),( dx2, dy2,-dz2),( dx2, dy2, dz2),( dx2,-dy2, dz2)],
+                    # -X face
+                    [(-dx2, dy2,-dz2),(-dx2,-dy2,-dz2),(-dx2,-dy2, dz2),(-dx2, dy2, dz2)],
+                    # +Y face
+                    [( dx2, dy2,-dz2),(-dx2, dy2,-dz2),(-dx2, dy2, dz2),( dx2, dy2, dz2)],
+                    # -Y face
+                    [(-dx2,-dy2,-dz2),( dx2,-dy2,-dz2),( dx2,-dy2, dz2),(-dx2,-dy2, dz2)],
+                    # +Z face
+                    [(-dx2,-dy2, dz2),( dx2,-dy2, dz2),( dx2, dy2, dz2),(-dx2, dy2, dz2)],
+                    # -Z face
+                    [(-dx2, dy2,-dz2),( dx2, dy2,-dz2),( dx2,-dy2,-dz2),(-dx2,-dy2,-dz2)],
+                ]
 
-                # NaN vertex 제거 (유효 셀 없는 코너)
-                valid_verts = ~np.isnan(vert_val)
-                vert_val = np.where(valid_verts, vert_val, np.nanmean(vert_val))
+                # 이웃 voxel 오프셋 (6방향)
+                neighbor_offsets = [
+                    (1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)
+                ]
 
-                # Face 인덱스 생성 (유효 셀만)
-                tri_i, tri_j, tri_k = [], [], []
-                face_val = []  # face별 intensity (face center value)
+                active = np.argwhere(~np.isnan(vox_val))
 
-                for ii in range(n_grid):
-                    for jj in range(n_grid):
-                        v = cell_val[ii, jj]
-                        if np.isnan(v):
-                            continue
-                        # 4 corners
-                        c00 = ii * ny1 + jj
-                        c01 = ii * ny1 + jj + 1
-                        c10 = (ii + 1) * ny1 + jj
-                        c11 = (ii + 1) * ny1 + jj + 1
-                        # Tri 1: c00, c01, c10
-                        tri_i.append(c00); tri_j.append(c01); tri_k.append(c10)
-                        face_val.append(v)
-                        # Tri 2: c01, c11, c10
-                        tri_i.append(c01); tri_j.append(c11); tri_k.append(c10)
-                        face_val.append(v)
+                for (ii, jj, kk) in active:
+                    v_center = vox_val[ii, jj, kk]
+                    ox, oy, oz = cx[ii], cy[jj], cz[kk]
 
-                if not tri_i:
+                    for face_idx, corners in enumerate(face_defs):
+                        # 이웃이 채워져 있으면 내부면 → 스킵 (외부 노출면만)
+                        ni, nj, nk = (ii + neighbor_offsets[face_idx][0],
+                                      jj + neighbor_offsets[face_idx][1],
+                                      kk + neighbor_offsets[face_idx][2])
+                        if (0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz
+                                and not np.isnan(vox_val[ni, nj, nk])):
+                            continue   # 내부면 — 스킵
+
+                        # quad → 2 triangles
+                        p0 = (ox+corners[0][0], oy+corners[0][1], oz+corners[0][2])
+                        p1 = (ox+corners[1][0], oy+corners[1][1], oz+corners[1][2])
+                        p2 = (ox+corners[2][0], oy+corners[2][1], oz+corners[2][2])
+                        p3 = (ox+corners[3][0], oy+corners[3][1], oz+corners[3][2])
+
+                        base = len(tri_vx)
+                        tri_vx.extend([p0[0],p1[0],p2[0],p3[0]])
+                        tri_vy.extend([p0[1],p1[1],p2[1],p3[1]])
+                        tri_vz.extend([p0[2],p1[2],p2[2],p3[2]])
+                        # tri1: 0,1,2  tri2: 0,2,3
+                        face_val_list.extend([v_center, v_center])
+
+                if not face_val_list:
                     return None
 
+                # vertex 수 = n_faces * 4, face 인덱스 = 연속 4개씩
+                n_faces = len(face_val_list)
+                idx_base = np.arange(n_faces) * 4
+                tri_i = np.concatenate([idx_base, idx_base])
+                tri_j = np.concatenate([idx_base + 1, idx_base + 2])
+                tri_k = np.concatenate([idx_base + 2, idx_base + 3])
+                face_colors = np.array(face_val_list * 2)
+
                 return {
-                    "x": vert_x, "y": vert_y, "z": vert_z,
-                    "i": np.array(tri_i), "j": np.array(tri_j), "k": np.array(tri_k),
-                    "intensity": vert_val,          # vertex-level (smooth shading)
-                    "facecolor": np.array(face_val), # face-level (flat, Moldflow style)
-                    "n_cells": len(tri_i) // 2,
+                    "x": np.array(tri_vx), "y": np.array(tri_vy), "z": np.array(tri_vz),
+                    "i": tri_i, "j": tri_j, "k": tri_k,
+                    "facecolor": face_colors,
+                    "n_cells": n_faces,
                 }
 
             for i, ftab in enumerate(field_tabs):
