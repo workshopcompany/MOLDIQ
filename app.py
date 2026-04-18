@@ -17,40 +17,159 @@ import requests
 
 
 # ══════════════════════════════════════════════════════════
-#  [FIX-1 & FIX-3] VTK/VTU 파서 — pyvista 없이 stdlib만 사용
-#  OpenFOAM foamToVTK -ascii 로 생성된 .vtu / .vtm 파일 처리
+#  VTK/VTU 파서 — pyvista 없이 stdlib만 사용
+#  OpenFOAM foamToVTK 결과 (.vtu ASCII/Binary, .vtm, ZIP) 처리
+#  NumPy 2.0 완전 호환 (ptp() 미사용)
 # ══════════════════════════════════════════════════════════
+
+# VTK DataArray type → numpy dtype 매핑
+_VTK_DTYPE = {
+    "Float32": np.float32, "Float64": np.float64,
+    "Int8": np.int8,  "Int16": np.int16,
+    "Int32": np.int32, "Int64": np.int64,
+    "UInt8": np.uint8, "UInt16": np.uint16,
+    "UInt32": np.uint32, "UInt64": np.uint64,
+}
+
+def _vtk_clean_xml(text: str) -> str:
+    """싱글/더블 쿼트 xmlns 속성 모두 제거 (ET 파싱 전처리)."""
+    # xmlns:xxx='...' 및 xmlns='...' (싱글/더블 쿼트 모두)
+    text = re.sub(r""" xmlns(?::[a-zA-Z0-9_]+)?=['\"][^'\"]*['\"]""", "", text)
+    return text
+
 def _read_dataarray(node: ET.Element) -> np.ndarray:
-    """VTK DataArray 노드에서 float 배열 추출 (ascii / binary 모두 지원)."""
-    enc = node.attrib.get("format", "ascii").lower()
+    """
+    VTK DataArray 노드 → float64 ndarray.
+    ASCII: text 직접 파싱
+    Binary (base64 inline): UInt32/UInt64 헤더 + 데이터 블록 디코딩
+    """
+    enc       = node.attrib.get("format", "ascii").lower()
+    vtk_type  = node.attrib.get("type", "Float32")
+    dtype     = _VTK_DTYPE.get(vtk_type, np.float32)
     text_data = (node.text or "").strip()
+
     if enc == "ascii":
-        return np.array(text_data.split(), dtype=np.float64)
-    elif enc in ("binary", "appended"):
+        if not text_data:
+            return np.array([], dtype=np.float64)
         try:
-            raw = base64.b64decode(text_data)
-            header_size = 8  # VTK: uint64 LE 블록 크기
-            dtype_map = {
-                "Float32": np.float32, "Float64": np.float64,
-                "Int32": np.int32,     "Int64": np.int64,
-            }
-            dtype = dtype_map.get(node.attrib.get("type", "Float32"), np.float32)
-            return np.frombuffer(raw[header_size:], dtype=dtype).astype(np.float64)
+            return np.array(text_data.split(), dtype=np.float64)
+        except ValueError:
+            return np.array([], dtype=np.float64)
+
+    elif enc == "binary":
+        # VTK binary inline: base64(header_bytes + data_bytes)
+        # header_type='UInt32' → 4 bytes, 'UInt64' → 8 bytes
+        if not text_data:
+            return np.array([], dtype=np.float64)
+        try:
+            # base64 패딩 보정
+            padded = text_data + "=" * ((-len(text_data)) % 4)
+            raw = base64.b64decode(padded)
+            # VTKFile header_type 속성 확인 (부모 루트에서 전달 불가 → 둘 다 시도)
+            for header_bytes in (8, 4):  # UInt64 먼저, 실패 시 UInt32
+                try:
+                    data_raw = raw[header_bytes:]
+                    arr = np.frombuffer(data_raw, dtype=dtype)
+                    if len(arr) > 0:
+                        return arr.astype(np.float64)
+                except Exception:
+                    continue
+            return np.array([], dtype=np.float64)
         except Exception:
             return np.array([], dtype=np.float64)
+
+    # appended 방식은 별도 처리 필요 → 빈 배열 반환 (현재 미지원)
     return np.array([], dtype=np.float64)
+
+
+def _build_df_from_piece(piece: ET.Element, n_pts: int, rho: float,
+                          material: str) -> pd.DataFrame:
+    """Piece 노드에서 좌표 + PointData → DataFrame 생성."""
+    # ── 좌표 ─────────────────────────────────────────────
+    pts_node = piece.find(".//Points/DataArray")
+    if pts_node is None:
+        raise ValueError("VTU: Points/DataArray 없음")
+
+    pts_flat = _read_dataarray(pts_node)
+    need = n_pts * 3
+    if len(pts_flat) < need:
+        raise ValueError(
+            f"VTU: 좌표 데이터 부족 ({len(pts_flat)} < {need}).\n"
+            f"힌트: binary 형식 파일은 foamToVTK -ascii 로 재변환하거나 "
+            f"단일 internal.vtu 파일을 직접 업로드하세요."
+        )
+    coords = pts_flat[:need].reshape(-1, 3)
+    result: dict = {
+        "x": coords[:, 0].astype(float),
+        "y": coords[:, 1].astype(float),
+        "z": coords[:, 2].astype(float),
+    }
+
+    # ── PointData 필드 (p, U, T, alpha.water 등) ─────────
+    for da in piece.findall(".//PointData/DataArray"):
+        name = da.attrib.get("Name", "").strip()
+        nc   = int(da.attrib.get("NumberOfComponents", "1"))
+        arr  = _read_dataarray(da)
+        try:
+            if nc == 1 and len(arr) >= n_pts:
+                result[name] = arr[:n_pts].astype(float)
+            elif nc == 3 and len(arr) >= n_pts * 3:
+                mat3 = arr[:n_pts * 3].reshape(-1, 3).astype(float)
+                result[f"{name}x"]    = mat3[:, 0]
+                result[f"{name}y"]    = mat3[:, 1]
+                result[f"{name}z"]    = mat3[:, 2]
+                result[f"{name}_mag"] = np.linalg.norm(mat3, axis=1)
+        except Exception:
+            pass
+
+    df = pd.DataFrame(result)
+
+    # ── 단위 변환 ─────────────────────────────────────────
+    # OpenFOAM kinematic pressure p [m²/s²] → 물리 압력 [MPa]
+    if "p" in df.columns:
+        p_kin  = df["p"].to_numpy(dtype=float)
+        p_pa   = p_kin * rho
+        p_mpa  = p_pa / 1e6
+        span   = float(p_mpa.max()) - float(p_mpa.min())
+        span_pa= float(p_pa.max())  - float(p_pa.min())
+        if span < 1e-4 and span_pa > 0:
+            p_mpa = p_pa / 1e3   # kPa 대체 (스케일이 너무 작을 때)
+        df["pressure"] = np.abs(p_mpa)
+    elif "pressure" not in df.columns:
+        df["pressure"] = 0.0
+
+    # 온도
+    if "T" in df.columns:
+        df["temperature"] = df["T"].to_numpy(dtype=float)
+    elif "temperature" not in df.columns:
+        if "U_mag" in df.columns:
+            uv    = df["U_mag"].to_numpy(dtype=float)
+            u_min = float(uv.min()); u_max = float(uv.max())
+            denom = (u_max - u_min) if (u_max - u_min) > 1e-9 else 1.0
+            df["temperature"] = 40.0 + (uv - u_min) / denom * 145.0
+        else:
+            df["temperature"] = 100.0
+
+    # 충진 시간 (압력 높을수록 gate에 가까움 → fill_time 낮음)
+    if "fill_time" not in df.columns:
+        pv    = df["pressure"].to_numpy(dtype=float)
+        p_min = float(pv.min()); p_max = float(pv.max())
+        span  = p_max - p_min
+        df["fill_time"] = (p_max - pv) / span if span > 1e-9 else np.linspace(0.0, 1.0, len(df))
+
+    df["material"] = material
+    return df
 
 
 def parse_vtu_to_dataframe(file_bytes: bytes, material: str = "17-4PH",
                             rho: float = 7780.0) -> pd.DataFrame:
     """
-    OpenFOAM ASCII .vtu 파일 → CAE DataFrame 변환.
-    반환 컬럼: x, y, z, pressure(MPa), temperature(°C), fill_time(s),
-               Ux, Uy, Uz, U_mag, material
-    NumPy 2.0 호환 (ptp() 미사용).
+    OpenFOAM .vtu 파일(ASCII/Binary) → CAE DataFrame.
+    반환 컬럼: x, y, z, pressure(MPa), temperature(°C),
+               fill_time(s), U_mag, Ux, Uy, Uz, material
     """
     text = file_bytes.decode("utf-8", errors="replace")
-    text = re.sub(r' xmlns[^"]*"[^"]*"', "", text)  # 네임스페이스 제거
+    text = _vtk_clean_xml(text)
     try:
         root = ET.fromstring(text)
     except ET.ParseError as e:
@@ -63,98 +182,85 @@ def parse_vtu_to_dataframe(file_bytes: bytes, material: str = "17-4PH",
     if n_pts == 0:
         raise ValueError("VTU: NumberOfPoints=0 — 빈 메쉬")
 
-    # ── 좌표 ─────────────────────────────────────────────
-    pts_node = piece.find(".//Points/DataArray")
-    if pts_node is None:
-        raise ValueError("VTU: Points/DataArray 없음")
-    pts_flat = _read_dataarray(pts_node)
-    need = n_pts * 3
-    if len(pts_flat) < need:
-        raise ValueError(f"VTU: 좌표 데이터 부족 ({len(pts_flat)} < {need})")
-    coords = pts_flat[:need].reshape(-1, 3)
-
-    result: dict = {
-        "x": coords[:, 0].astype(float),
-        "y": coords[:, 1].astype(float),
-        "z": coords[:, 2].astype(float),
-    }
-
-    # ── PointData 필드 ────────────────────────────────────
-    for da in piece.findall(".//PointData/DataArray"):
-        name = da.attrib.get("Name", "")
-        nc   = int(da.attrib.get("NumberOfComponents", "1"))
-        arr  = _read_dataarray(da)
-        try:
-            if nc == 1 and len(arr) >= n_pts:
-                result[name] = arr[:n_pts].astype(float)
-            elif nc == 3 and len(arr) >= n_pts * 3:
-                mat3 = arr[:n_pts * 3].reshape(-1, 3).astype(float)
-                result[f"{name}x"]   = mat3[:, 0]
-                result[f"{name}y"]   = mat3[:, 1]
-                result[f"{name}z"]   = mat3[:, 2]
-                result[f"{name}_mag"] = np.linalg.norm(mat3, axis=1)
-        except Exception:
-            pass  # 파싱 불가 필드는 건너뜀
-
-    df = pd.DataFrame(result)
-
-    # ── 압력: OpenFOAM kinematic p [m²/s²] → MPa ────────
-    if "p" in df.columns:
-        p_kin  = df["p"].to_numpy(dtype=float)
-        p_pa   = p_kin * rho
-        p_mpa  = p_pa / 1e6
-        rng_mpa = float(p_mpa.max()) - float(p_mpa.min())
-        rng_pa  = float(p_pa.max())  - float(p_pa.min())
-        if rng_mpa < 1e-4 and rng_pa > 0:
-            p_mpa = p_pa / 1e3        # kPa 스케일로 대체
-        df["pressure"] = np.abs(p_mpa)
-    elif "pressure" not in df.columns:
-        df["pressure"] = 0.0
-
-    # ── 온도 ─────────────────────────────────────────────
-    if "T" in df.columns:
-        df["temperature"] = df["T"].to_numpy(dtype=float)
-    elif "temperature" not in df.columns:
-        if "U_mag" in df.columns:
-            uv   = df["U_mag"].to_numpy(dtype=float)
-            umin = float(uv.min());  umax = float(uv.max())
-            denom = (umax - umin) if (umax - umin) > 1e-9 else 1.0
-            df["temperature"] = 40.0 + (uv - umin) / denom * 145.0
-        else:
-            df["temperature"] = 100.0
-
-    # ── 충진 시간 ─────────────────────────────────────────
-    if "fill_time" not in df.columns:
-        pv    = df["pressure"].to_numpy(dtype=float)
-        pmin  = float(pv.min()); pmax = float(pv.max())
-        pspan = pmax - pmin
-        if pspan > 1e-9:
-            df["fill_time"] = (pmax - pv) / pspan
-        else:
-            df["fill_time"] = np.linspace(0.0, 1.0, len(df))
-
-    df["material"] = material
-    return df
+    return _build_df_from_piece(piece, n_pts, rho, material)
 
 
-
-
-def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH") -> pd.DataFrame:
+def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH",
+                                rho: float = 7780.0) -> pd.DataFrame:
     """
-    ZIP 파일 안의 internal.vtu (또는 첫 번째 .vtu)를 찾아 파싱.
-    여러 타임스텝이 있으면 가장 마지막 타임스텝 우선.
+    ZIP 파일 안의 VTK 결과를 DataFrame으로 변환.
+    우선순위:
+      1. .vtm 파일의 DataSet file= 참조를 따라 internal.vtu 찾기
+      2. ZIP 내 'internal'이 포함된 .vtu
+      3. ZIP 내 가장 큰 .vtu (가장 많은 데이터)
+    각 파일은 ASCII → Binary 순으로 파싱 시도.
     """
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-        all_vtu = [n for n in z.namelist() if n.endswith(".vtu")]
-        if not all_vtu:
-            raise FileNotFoundError("ZIP 안에 .vtu 파일이 없습니다.")
+    buf = io.BytesIO(zip_bytes)
+    if not zipfile.is_zipfile(buf):
+        raise ValueError("유효한 ZIP 파일이 아닙니다.")
 
-        # internal.vtu 우선, 없으면 마지막 타임스텝의 첫 번째 vtu
-        internal = [n for n in all_vtu if "internal" in n.lower()]
-        target = internal[-1] if internal else all_vtu[-1]
-        data = z.read(target)
+    with zipfile.ZipFile(buf) as z:
+        names = z.namelist()
 
-    return parse_vtu_to_dataframe(data, material=material)
+        # 전략 1: .vtm 파일이 있으면 DataSet file= 경로로 추적
+        vtm_files = [n for n in names if n.lower().endswith(".vtm")]
+        vtu_candidate = None
+        for vtm_path in vtm_files:
+            try:
+                vtm_text = _vtk_clean_xml(z.read(vtm_path).decode("utf-8", errors="replace"))
+                vtm_root = ET.fromstring(vtm_text)
+                for ds in vtm_root.findall(".//DataSet"):
+                    ref = ds.attrib.get("file", "")
+                    if "internal" in ref.lower() and ref.lower().endswith(".vtu"):
+                        # 절대경로 또는 상대경로 처리
+                        base_dir = os.path.dirname(vtm_path)
+                        candidate = os.path.join(base_dir, ref).replace("\\", "/")
+                        # ZIP 내 파일 존재 여부 확인
+                        if candidate in names:
+                            vtu_candidate = candidate
+                            break
+                        # 경로 구분자 차이 보정
+                        for n in names:
+                            if n.endswith(ref) or n.endswith(os.path.basename(ref)):
+                                vtu_candidate = n
+                                break
+            except Exception:
+                continue
+            if vtu_candidate:
+                break
+
+        # 전략 2: internal 포함 .vtu 직접 검색
+        all_vtu = [n for n in names if n.lower().endswith(".vtu")]
+        if not vtu_candidate:
+            internal_vtu = [n for n in all_vtu if "internal" in n.lower()]
+            if internal_vtu:
+                # 마지막 타임스텝(숫자 기준 정렬)
+                vtu_candidate = sorted(internal_vtu)[-1]
+
+        # 전략 3: 가장 큰 .vtu (데이터가 가장 풍부)
+        if not vtu_candidate and all_vtu:
+            vtu_candidate = max(all_vtu, key=lambda n: z.getinfo(n).file_size)
+
+        if not vtu_candidate:
+            raise FileNotFoundError(
+                "ZIP 내에 .vtu 파일이 없습니다.\n"
+                "foamToVTK 실행 후 VTK/ 폴더를 ZIP으로 압축해 업로드하세요."
+            )
+
+        vtu_bytes = z.read(vtu_candidate)
+
+    # 선택된 파일 파싱 (ASCII 우선, 실패 시 오류 메시지 상세화)
+    try:
+        df = parse_vtu_to_dataframe(vtu_bytes, material=material, rho=rho)
+        df.attrs["source_file"] = vtu_candidate
+        return df
+    except ValueError as e:
+        raise ValueError(
+            f"VTU 파싱 실패 ({os.path.basename(vtu_candidate)}): {e}\n\n"
+            "📌 해결 방법:\n"
+            "  1. foamToVTK -ascii 로 재실행 후 VTK/ 폴더를 ZIP 압축\n"
+            "  2. 또는 internal.vtu 파일만 직접 업로드"
+        )
 
 # ── 경로 설정 ──────────────────────────────────────────────
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -341,11 +447,11 @@ def style_verdict_df(df, verdict_col="판정"):
 
 # ── [FIX] GitHub 연결 상태 확인 / 안내 헬퍼 ─────────────────
 def _check_github_secrets() -> bool:
-    """Streamlit secrets에 GITHUB_TOKEN이 설정됐는지 확인."""
+    """Streamlit secrets에 GITHUB_TOKEN이 유효하게 설정됐는지 확인."""
     try:
-        token = st.secrets.get("GITHUB_TOKEN", "")
-        return bool(token and token.strip() and token != "ghp_xxxxxxxxxxxx")
-    except Exception:
+        token = st.secrets["GITHUB_TOKEN"]
+        return bool(token and str(token).strip() and str(token) != "ghp_xxxxxxxxxxxx")
+    except (KeyError, FileNotFoundError, Exception):
         return False
 
 
@@ -746,40 +852,46 @@ elif current_stage == "stage1":
 
             # ── 진단 버튼 ──────────────────────────────────────────
             if st.button("🔍 아티팩트 목록 확인", help="GitHub에서 실제 아티팩트 목록을 가져와 Signal ID를 직접 확인합니다"):
-                # list_artifacts 가 core.flow_csv_generator에 없을 수 있으므로 안전하게 처리
-                _list_fn = None
-                try:
-                    from core.flow_csv_generator import list_artifacts as _list_fn
-                except ImportError:
-                    pass
 
-                if _list_fn is None:
-                    st.warning(
-                        "⚠️ `list_artifacts` 함수가 `core/flow_csv_generator.py`에 없습니다.\n\n"
-                        "**해결 방법:** GitHub Actions → 완료된 워크플로 → Artifacts 섹션에서\n"
-                        "아티팩트 이름(또는 숫자 ID)을 직접 확인 후 아래 Signal ID 필드에 입력하세요."
-                    )
+                def _fetch_artifacts_direct(per_page: int = 20) -> list:
+                    """GitHub API로 artifacts 목록 직접 조회 (flow_csv_generator 미의존)."""
+                    try:
+                        token = st.secrets["GITHUB_TOKEN"]
+                        owner = st.secrets.get("OPENFOAM_REPO_OWNER", "workshopcompany")
+                        repo  = st.secrets.get("OPENFOAM_REPO_NAME",  "OpenFOAM-Injection-Automation")
+                    except (KeyError, FileNotFoundError):
+                        raise RuntimeError("GITHUB_TOKEN이 Secrets에 없습니다.")
+                    url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
+                    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+                    resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=10)
+                    if resp.status_code == 401:
+                        raise RuntimeError("GITHUB_TOKEN이 유효하지 않습니다 (401 Unauthorized).")
+                    if resp.status_code == 404:
+                        raise RuntimeError(f"저장소를 찾을 수 없습니다: {owner}/{repo} (404)")
+                    resp.raise_for_status()
+                    return resp.json().get("artifacts", [])
+
+                if not _check_github_secrets():
+                    _show_github_token_guide()
                 else:
-                    _github_ok = _check_github_secrets()
-                    if not _github_ok:
+                    try:
+                        with st.spinner("GitHub에서 목록 가져오는 중..."):
+                            artifacts = _fetch_artifacts_direct(per_page=20)
+                        if artifacts:
+                            st.success(f"✅ {len(artifacts)}개 아티팩트 발견 — 숫자 ID 또는 이름 전체를 Signal ID에 입력하세요")
+                            st.dataframe([{
+                                "아티팩트 이름": a["name"],
+                                "생성일":        a["created_at"][:10],
+                                "크기(MB)":      f"{a.get('size_in_bytes',0)/1024/1024:.1f}",
+                                "만료일":        a.get("expires_at", "")[:10],
+                            } for a in artifacts], use_container_width=True, hide_index=True)
+                        else:
+                            st.warning("⚠️ 아티팩트가 없습니다. MIM-Ops에서 시뮬레이션을 먼저 실행하세요.")
+                    except RuntimeError as e:
+                        st.error(str(e))
                         _show_github_token_guide()
-                    else:
-                        try:
-                            with st.spinner("GitHub에서 목록 가져오는 중..."):
-                                artifacts = _list_fn(per_page=20)
-                            if artifacts:
-                                st.success(f"✅ {len(artifacts)}개 아티팩트 발견 — 아래 이름(또는 숫자부분)을 Signal ID에 입력하세요")
-                                st.dataframe([{
-                                    "아티팩트 이름": a["name"],
-                                    "생성일":        a["created_at"][:10],
-                                    "크기(MB)":      f"{a.get('size_in_bytes',0)/1024/1024:.1f}",
-                                } for a in artifacts], use_container_width=True, hide_index=True)
-                            else:
-                                st.warning("⚠️ 아티팩트가 없습니다. MIM-Ops에서 시뮬레이션을 먼저 실행하세요.")
-                        except Exception as e:
-                            st.error(f"❌ GitHub API 오류: {e}")
-                            if "404" in str(e):
-                                st.warning("저장소 이름을 확인하세요. Secrets의 OPENFOAM_REPO_NAME이 정확한지 확인하세요.")
+                    except Exception as e:
+                        st.error(f"❌ GitHub API 오류: {e}")
 
             st.divider()
 
