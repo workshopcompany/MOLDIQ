@@ -46,11 +46,11 @@ def parse_vtu_to_dataframe(file_bytes: bytes, material: str = "17-4PH",
     """
     OpenFOAM ASCII .vtu 파일 → CAE DataFrame 변환.
     반환 컬럼: x, y, z, pressure(MPa), temperature(°C), fill_time(s),
-               Ux, Uy, Uz, velocity_mag, material
+               Ux, Uy, Uz, U_mag, material
+    NumPy 2.0 호환 (ptp() 미사용).
     """
     text = file_bytes.decode("utf-8", errors="replace")
-    # 네임스페이스 제거
-    text = re.sub(r' xmlns[^"]*"[^"]*"', "", text)
+    text = re.sub(r' xmlns[^"]*"[^"]*"', "", text)  # 네임스페이스 제거
     try:
         root = ET.fromstring(text)
     except ET.ParseError as e:
@@ -58,72 +58,85 @@ def parse_vtu_to_dataframe(file_bytes: bytes, material: str = "17-4PH",
 
     piece = root.find(".//Piece")
     if piece is None:
-        raise ValueError("VTU: <Piece> 태그를 찾을 수 없습니다.")
+        raise ValueError("VTU: <Piece> 태그 없음")
     n_pts = int(piece.attrib.get("NumberOfPoints", 0))
+    if n_pts == 0:
+        raise ValueError("VTU: NumberOfPoints=0 — 빈 메쉬")
 
-    # ── 좌표 ──────────────────────────────────────────────
+    # ── 좌표 ─────────────────────────────────────────────
     pts_node = piece.find(".//Points/DataArray")
     if pts_node is None:
         raise ValueError("VTU: Points/DataArray 없음")
     pts_flat = _read_dataarray(pts_node)
-    coords = pts_flat.reshape(-1, 3)[:n_pts]
+    need = n_pts * 3
+    if len(pts_flat) < need:
+        raise ValueError(f"VTU: 좌표 데이터 부족 ({len(pts_flat)} < {need})")
+    coords = pts_flat[:need].reshape(-1, 3)
 
     result: dict = {
-        "x": coords[:, 0],
-        "y": coords[:, 1],
-        "z": coords[:, 2],
+        "x": coords[:, 0].astype(float),
+        "y": coords[:, 1].astype(float),
+        "z": coords[:, 2].astype(float),
     }
 
-    # ── PointData 필드 (p, U, T 등) ─────────────────────
+    # ── PointData 필드 ────────────────────────────────────
     for da in piece.findall(".//PointData/DataArray"):
         name = da.attrib.get("Name", "")
-        nc = int(da.attrib.get("NumberOfComponents", "1"))
-        arr = _read_dataarray(da)
-        if nc == 1 and len(arr) >= n_pts:
-            result[name] = arr[:n_pts]
-        elif nc == 3 and len(arr) >= n_pts * 3:
-            mat3 = arr[: n_pts * 3].reshape(-1, 3)
-            result[f"{name}x"] = mat3[:, 0]
-            result[f"{name}y"] = mat3[:, 1]
-            result[f"{name}z"] = mat3[:, 2]
-            result[f"{name}_mag"] = np.linalg.norm(mat3, axis=1)
+        nc   = int(da.attrib.get("NumberOfComponents", "1"))
+        arr  = _read_dataarray(da)
+        try:
+            if nc == 1 and len(arr) >= n_pts:
+                result[name] = arr[:n_pts].astype(float)
+            elif nc == 3 and len(arr) >= n_pts * 3:
+                mat3 = arr[:n_pts * 3].reshape(-1, 3).astype(float)
+                result[f"{name}x"]   = mat3[:, 0]
+                result[f"{name}y"]   = mat3[:, 1]
+                result[f"{name}z"]   = mat3[:, 2]
+                result[f"{name}_mag"] = np.linalg.norm(mat3, axis=1)
+        except Exception:
+            pass  # 파싱 불가 필드는 건너뜀
 
     df = pd.DataFrame(result)
 
-    # ── 압력 변환: OpenFOAM kinematic p (m²/s²) → MPa ──
+    # ── 압력: OpenFOAM kinematic p [m²/s²] → MPa ────────
     if "p" in df.columns:
-        p_pa = df["p"].values * rho          # Pa
-        p_mpa = p_pa / 1e6                   # MPa
-        # 값이 너무 작으면(이미 Pa 스케일이면) kPa로 재시도
-        if p_mpa.ptp() < 1e-4 and p_pa.ptp() > 0:
-            p_mpa = p_pa / 1e3               # kPa → 표시용
-        df["pressure"] = np.abs(p_mpa)       # 음수 보정
+        p_kin  = df["p"].to_numpy(dtype=float)
+        p_pa   = p_kin * rho
+        p_mpa  = p_pa / 1e6
+        rng_mpa = float(p_mpa.max()) - float(p_mpa.min())
+        rng_pa  = float(p_pa.max())  - float(p_pa.min())
+        if rng_mpa < 1e-4 and rng_pa > 0:
+            p_mpa = p_pa / 1e3        # kPa 스케일로 대체
+        df["pressure"] = np.abs(p_mpa)
     elif "pressure" not in df.columns:
         df["pressure"] = 0.0
 
     # ── 온도 ─────────────────────────────────────────────
     if "T" in df.columns:
-        df["temperature"] = df["T"]
+        df["temperature"] = df["T"].to_numpy(dtype=float)
     elif "temperature" not in df.columns:
-        # 속도장으로 온도 근사
-        u_col = "U_mag" if "U_mag" in df.columns else None
-        if u_col:
-            u_n = (df[u_col] - df[u_col].min()) / (df[u_col].ptp() + 1e-9)
-            df["temperature"] = 40.0 + u_n * 145.0  # 40~185 °C
+        if "U_mag" in df.columns:
+            uv   = df["U_mag"].to_numpy(dtype=float)
+            umin = float(uv.min());  umax = float(uv.max())
+            denom = (umax - umin) if (umax - umin) > 1e-9 else 1.0
+            df["temperature"] = 40.0 + (uv - umin) / denom * 145.0
         else:
             df["temperature"] = 100.0
 
-    # ── 충진 시간: 압력이 높을수록 먼저 채워짐 ──────────
+    # ── 충진 시간 ─────────────────────────────────────────
     if "fill_time" not in df.columns:
-        p = df["pressure"].values
-        p_range = p.ptp()
-        if p_range > 1e-9:
-            df["fill_time"] = (p.max() - p) / p_range
+        pv    = df["pressure"].to_numpy(dtype=float)
+        pmin  = float(pv.min()); pmax = float(pv.max())
+        pspan = pmax - pmin
+        if pspan > 1e-9:
+            df["fill_time"] = (pmax - pv) / pspan
         else:
-            df["fill_time"] = np.linspace(0, 1, len(df))
+            df["fill_time"] = np.linspace(0.0, 1.0, len(df))
 
     df["material"] = material
     return df
+
+
 
 
 def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH") -> pd.DataFrame:
@@ -324,6 +337,43 @@ def style_verdict_df(df, verdict_col="판정"):
         if v == "FAIL": return ["background-color: rgba(255,59,92,0.08)"] * len(row)
         return [""] * len(row)
     return df.style.apply(color_row, axis=1)
+
+
+# ── [FIX] GitHub 연결 상태 확인 / 안내 헬퍼 ─────────────────
+def _check_github_secrets() -> bool:
+    """Streamlit secrets에 GITHUB_TOKEN이 설정됐는지 확인."""
+    try:
+        token = st.secrets.get("GITHUB_TOKEN", "")
+        return bool(token and token.strip() and token != "ghp_xxxxxxxxxxxx")
+    except Exception:
+        return False
+
+
+def _show_github_token_guide():
+    """GitHub Token 미설정 시 단계별 안내 UI 표시."""
+    st.error("🔑 **GITHUB_TOKEN이 설정되지 않았습니다.**")
+    with st.expander("📋 설정 방법 — 클릭해서 펼치기", expanded=True):
+        st.markdown("""
+**Streamlit Cloud를 사용하는 경우:**
+1. [share.streamlit.io](https://share.streamlit.io) → 앱 → ⋯ 메뉴 → **Edit secrets**
+2. 아래 내용을 붙여넣고 토큰값만 교체:
+
+```toml
+GITHUB_TOKEN        = "ghp_YOUR_TOKEN_HERE"
+OPENFOAM_REPO_OWNER = "workshopcompany"
+OPENFOAM_REPO_NAME  = "OpenFOAM-Injection-Automation"
+```
+
+**로컬 실행의 경우:**
+프로젝트 루트 `.streamlit/secrets.toml` 파일을 위 내용으로 생성.
+
+**GitHub Token 발급:**
+GitHub → Settings → Developer settings → Personal access tokens → Generate new token (classic)
+→ `repo` 권한 체크 → 생성된 토큰 복사
+
+---
+💡 **GitHub 없이 바로 사용:** 아래 **Option C** (VTK 파일 직접 업로드)로 결과를 로드하세요.
+        """)
 
 
 # ══════════════════════════════════════════════════════════
@@ -654,9 +704,6 @@ elif current_stage == "stage0":
             st.error("❌ Design Revision Required before proceeding.")
 
 
-# ══════════════════════════════════════════════════════════
-#  STAGE 1: Flow Analysis
-# ══════════════════════════════════════════════════════════
 elif current_stage == "stage1":
     st.markdown('<div class="stage-tag">STAGE 1 · FLOW ANALYSIS</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="stage-title">{T["st1_title"]}</div>', unsafe_allow_html=True)
@@ -699,28 +746,40 @@ elif current_stage == "stage1":
 
             # ── 진단 버튼 ──────────────────────────────────────────
             if st.button("🔍 아티팩트 목록 확인", help="GitHub에서 실제 아티팩트 목록을 가져와 Signal ID를 직접 확인합니다"):
+                # list_artifacts 가 core.flow_csv_generator에 없을 수 있으므로 안전하게 처리
+                _list_fn = None
                 try:
-                    from core.flow_csv_generator import list_artifacts
-                    with st.spinner("GitHub에서 목록 가져오는 중..."):
-                        artifacts = list_artifacts(per_page=20)
-                    if artifacts:
-                        st.success(f"✅ {len(artifacts)}개 아티팩트 발견 — 아래 이름(또는 숫자부분)을 Signal ID에 입력하세요")
-                        st.dataframe([{
-                            "아티팩트 이름": a["name"],
-                            "생성일":        a["created_at"][:10],
-                            "크기(MB)":      f"{a.get('size_in_bytes',0)/1024/1024:.1f}",
-                        } for a in artifacts], use_container_width=True, hide_index=True)
+                    from core.flow_csv_generator import list_artifacts as _list_fn
+                except ImportError:
+                    pass
+
+                if _list_fn is None:
+                    st.warning(
+                        "⚠️ `list_artifacts` 함수가 `core/flow_csv_generator.py`에 없습니다.\n\n"
+                        "**해결 방법:** GitHub Actions → 완료된 워크플로 → Artifacts 섹션에서\n"
+                        "아티팩트 이름(또는 숫자 ID)을 직접 확인 후 아래 Signal ID 필드에 입력하세요."
+                    )
+                else:
+                    _github_ok = _check_github_secrets()
+                    if not _github_ok:
+                        _show_github_token_guide()
                     else:
-                        st.warning("⚠️ 아티팩트가 없습니다. MIM-Ops에서 시뮬레이션을 먼저 실행하세요.")
-                except Exception as e:
-                    st.error(str(e))
-                    if "GITHUB_TOKEN" in str(e):
-                        st.code('''# Streamlit Cloud Secrets에 추가:
-GITHUB_TOKEN          = "ghp_xxxxxxxxxxxx"
-OPENFOAM_REPO_OWNER   = "workshopcompany"
-OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
-                    elif "404" in str(e):
-                        st.warning("저장소 이름을 확인하세요. Secrets의 OPENFOAM_REPO_NAME이 정확한지 확인하세요.")
+                        try:
+                            with st.spinner("GitHub에서 목록 가져오는 중..."):
+                                artifacts = _list_fn(per_page=20)
+                            if artifacts:
+                                st.success(f"✅ {len(artifacts)}개 아티팩트 발견 — 아래 이름(또는 숫자부분)을 Signal ID에 입력하세요")
+                                st.dataframe([{
+                                    "아티팩트 이름": a["name"],
+                                    "생성일":        a["created_at"][:10],
+                                    "크기(MB)":      f"{a.get('size_in_bytes',0)/1024/1024:.1f}",
+                                } for a in artifacts], use_container_width=True, hide_index=True)
+                            else:
+                                st.warning("⚠️ 아티팩트가 없습니다. MIM-Ops에서 시뮬레이션을 먼저 실행하세요.")
+                        except Exception as e:
+                            st.error(f"❌ GitHub API 오류: {e}")
+                            if "404" in str(e):
+                                st.warning("저장소 이름을 확인하세요. Secrets의 OPENFOAM_REPO_NAME이 정확한지 확인하세요.")
 
             st.divider()
 
@@ -742,21 +801,28 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
                 if not signal_id.strip():
                     st.warning("Signal ID를 입력하세요. 모르면 위 '아티팩트 목록 확인' 버튼을 먼저 누르세요.")
                 else:
-                    with st.spinner(f"'{signal_id.strip()}' 결과 가져오는 중..."):
-                        try:
-                            cae_df = generate_flow_csv_from_github(signal_id.strip())
-                            st.session_state["cae_df"] = cae_df
-                            st.session_state["github_sim_signal_id"] = signal_id.strip()
-                            st.session_state["flow_csv_ready"] = True
-                            st.success(
-                                f"✅ 로드 완료! {len(cae_df):,}개 포인트 | "
-                                f"재료: {cae_df['material'].iloc[0]} | "
-                                f"최대 압력: {cae_df['pressure'].max():.1f} MPa"
-                            )
-                        except FileNotFoundError as e:
-                            st.error(str(e))
-                        except Exception as e:
-                            st.error(f"❌ 오류: {e}")
+                    _github_ok = _check_github_secrets()
+                    if not _github_ok:
+                        _show_github_token_guide()
+                    else:
+                        with st.spinner(f"'{signal_id.strip()}' 결과 가져오는 중..."):
+                            try:
+                                cae_df = generate_flow_csv_from_github(signal_id.strip())
+                                st.session_state["cae_df"] = cae_df
+                                st.session_state["github_sim_signal_id"] = signal_id.strip()
+                                st.session_state["flow_csv_ready"] = True
+                                st.success(
+                                    f"✅ 로드 완료! {len(cae_df):,}개 포인트 | "
+                                    f"재료: {cae_df['material'].iloc[0]} | "
+                                    f"최대 압력: {cae_df['pressure'].max():.1f} MPa"
+                                )
+                            except FileNotFoundError as e:
+                                st.error(str(e))
+                            except Exception as e:
+                                _emsg = str(e)
+                                st.error(f"❌ 오류: {_emsg}")
+                                if "GITHUB_TOKEN" in _emsg or "token" in _emsg.lower():
+                                    _show_github_token_guide()
 
             if st.session_state.get("flow_csv_ready") and st.session_state.get("cae_df") is not None:
                 df_preview = st.session_state["cae_df"]
@@ -1369,7 +1435,7 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
                                         "Y": solid_df["y"].values,
                                         "Z": _z_col,
                                     }[_clip_axis]
-                                    _cut = _ax_data.min() + (_ax_data.ptp() * _clip_ratio / 100)
+                                    _cut = _ax_data.min() + ((_ax_data.max() - _ax_data.min()) * _clip_ratio / 100)
                                     _mask = _ax_data <= _cut
 
                                 _fig_solid = go.Figure()
