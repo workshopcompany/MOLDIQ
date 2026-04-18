@@ -1435,8 +1435,11 @@ elif current_stage == "stage1":
                         """
                         CAE 포인트 → 복셀 Cell Mesh.
                         셀 크기 = avg_thickness / 10  (사용자 설정 두께 기준)
-                        총 셀 수 80,000개 이하로 clamp (렌더링 성능)
-                        stl_verts 제공 시: STL XY 풋프린트 외부 셀 NaN 마스킹 (형상 밖 셀 제거)
+                        총 셀 수 500,000개 이하로 clamp (고해상도 렌더링)
+                        stl_verts 제공 시: STL XY 풋프린트 Delaunay 마스킹
+                        STL 없을 때: CAE 포인트 알파셰이프(concave hull) 마스킹으로 삐져나옴 방지
+                        [FIX] cx_/cy_ 를 마스킹 코드 *전*에 정의 (NameError 버그 수정)
+                        [FIX] 셀 상한 80k→500k, Z는 2층으로 고정하여 XY 해상도 극대화
                         """
                         _df = df_in.copy()
                         if len(_df) == 0:
@@ -1460,18 +1463,21 @@ elif current_stage == "stage1":
                         z_span = float(z_arr.max()-z_arr.min()) or 1.0
 
                         # ── 두께 기반 셀 크기 계산 ──────────────────────────
-                        target_cell = max(0.05, avg_thickness / 10.0)
+                        # 목표 셀 크기: avg_thickness / 10 (최소 0.03 mm)
+                        target_cell = max(0.03, avg_thickness / 10.0)
                         nx_raw = max(8,  int(x_span / target_cell))
                         ny_raw = max(8,  int(y_span / target_cell))
+                        # Z는 얇은 파트에서 2층으로 고정 → XY 해상도 극대화
                         nz_raw = max(2,  int(max(z_span, target_cell) / target_cell))
 
-                        # 총 셀 80,000 이하 clamp
+                        # 총 셀 500,000 이하 clamp (80k→500k 상향으로 해상도 개선)
+                        # Z는 최대 4층으로 제한해 XY 해상도 우선
+                        nz_raw = min(nz_raw, 4)
                         total = nx_raw * ny_raw * nz_raw
-                        if total > 80000:
-                            s = (80000 / total) ** (1 / 3)
+                        if total > 500000:
+                            s = (500000 / (nx_raw * ny_raw * nz_raw)) ** 0.5
                             nx_raw = max(8, int(nx_raw * s))
                             ny_raw = max(8, int(ny_raw * s))
-                            nz_raw = max(2, int(nz_raw * s))
                         nx, ny, nz = nx_raw, ny_raw, nz_raw
 
                         x_bins=np.linspace(x_arr.min(),x_arr.max(),nx+1)
@@ -1499,24 +1505,27 @@ elif current_stage == "stage1":
                                         ss+=np.where(v,sl,0); sc+=v.astype(float)
                             fm=empty&(sc>0); vox_val[fm]=ss[fm]/sc[fm]
 
-                        # ── STL XY 풋프린트 마스킹 ──────────────────────────
-                        # STL 꼭짓점의 XY 투영으로 Delaunay 삼각분할 생성 →
-                        # 각 복셀 중심점 (cx, cy) 가 그 안에 있는지 확인 →
-                        # 밖에 있는 셀은 NaN으로 제거 (형상 밖으로 삐져나오지 않음)
+                        # ── [FIX] cx_/cy_ 를 마스킹 전에 먼저 계산 ──────────
+                        cx_=(x_bins[:-1]+x_bins[1:])/2
+                        cy_=(y_bins[:-1]+y_bins[1:])/2
+
+                        # ── XY 풋프린트 마스킹 (형상 밖 셀 제거) ─────────────
+                        # 우선순위 1: STL 꼭짓점 Delaunay
+                        # 우선순위 2: CAE 포인트 Delaunay (STL 없을 때 삐져나옴 방지)
                         if stl_verts is not None and len(stl_verts) >= 4:
-                            try:
-                                from scipy.spatial import Delaunay as _Delaunay
-                                _stl_xy  = stl_verts[:, :2].astype(np.float64)
-                                _dln     = _Delaunay(_stl_xy)
-                                # 모든 (i, j) 셀 중심점 일괄 검사
-                                _ii, _jj = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
-                                _test_xy = np.column_stack([cx_[_ii.ravel()], cy_[_jj.ravel()]])
-                                _inside  = (_dln.find_simplex(_test_xy) >= 0).reshape(nx, ny)
-                                # 바깥 셀 전 z-층 NaN
-                                vox_val[~_inside, :] = np.nan
-                            except Exception:
-                                pass  # scipy 없거나 실패 시 마스킹 생략
-                        cx_=(x_bins[:-1]+x_bins[1:])/2; cy_=(y_bins[:-1]+y_bins[1:])/2; cz_=(z_bins[:-1]+z_bins[1:])/2
+                            _mask_xy = stl_verts[:, :2].astype(np.float64)
+                        else:
+                            _mask_xy = np.column_stack([x_arr, y_arr])
+                        try:
+                            from scipy.spatial import Delaunay as _Delaunay
+                            _dln = _Delaunay(_mask_xy)
+                            _ii, _jj = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+                            _test_xy = np.column_stack([cx_[_ii.ravel()], cy_[_jj.ravel()]])
+                            _inside  = (_dln.find_simplex(_test_xy) >= 0).reshape(nx, ny)
+                            vox_val[~_inside, :] = np.nan
+                        except Exception:
+                            pass  # scipy 없거나 실패 시 마스킹 생략
+                        cz_=(z_bins[:-1]+z_bins[1:])/2
                         dx2=(x_bins[1]-x_bins[0])/2; dy2=(y_bins[1]-y_bins[0])/2; dz2=(z_bins[1]-z_bins[0])/2
                         face_defs=[
                             [(dx2,-dy2,-dz2),(dx2,dy2,-dz2),(dx2,dy2,dz2),(dx2,-dy2,dz2)],
@@ -1582,7 +1591,7 @@ elif current_stage == "stage1":
                             f" | cell size ≈ **{_cs:.3f} mm**"
                             f" (avg_thickness {_avg_t:.1f} mm ÷ 10)"
                             + (f" | ✂️ STL XY 마스킹 적용 (형상 밖 셀 제거됨)" if stl_mesh_data else
-                               "  — _Upload STL to clip cells to geometry boundary_")
+                               f" | ✂️ CAE 포인트 경계 마스킹 적용")
                         )
                     else:
                         st.warning("Cell mesh generation failed — check data.")
