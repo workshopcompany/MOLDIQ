@@ -50,55 +50,75 @@ def _read_dataarray_ascii(node: ET.Element) -> np.ndarray:
 
 # ── B) Appended+Base64+ZLib 파서 ─────────────────────────
 def _parse_appended_block(b64_stream: bytes, char_offset: int,
-                           header_type: str = "UInt32") -> bytes:
+                          header_type: str = "UInt32") -> bytes:
     """
     VTK appended base64+zlib 블록을 압축 해제해 raw bytes 반환.
-
-    VTK 파일 구조:
-      <AppendedData encoding="base64">
-        _[헤더서브블록==[데이터서브블록][헤더==[데이터]][...]
-      </AppendedData>
-
-    각 DataArray는 b64_stream 내 offset 위치에:
-      - 헤더 서브블록 (== 패딩 포함): n_blocks, uncomp_sz, last_sz, comp_sizes[n]
-      - 데이터 서브블록: zlib 압축 청크들
-
-    헤더와 데이터가 같은 서브블록에 있는 경우(offset 0 등)도 처리.
+    
+    [수정됨] 
+    1. Base64 인코딩 시 발생하는 줄바꿈(\n) 및 공백 제거 로직 추가 (길이 계산 오류 방지)
+    2. 블록 0 (헤더/데이터 병합) 패턴과 블록 1/2 (헤더/데이터 분리) 패턴을 동적으로 감지하여 파싱
     """
     hsz  = 4 if header_type == "UInt32" else 8
     hfmt = "<I" if header_type == "UInt32" else "<Q"
 
-    # 헤더 서브블록: char_offset 부터 다음 '==' 까지
-    eq_pos = b64_stream.find(b"==", char_offset)
-    if eq_pos == -1:
-        raise ValueError(f"헤더 블록 끝(==)을 찾을 수 없음 (offset={char_offset})")
-    hdr_end = eq_pos + 2
-    hdr_raw = base64.b64decode(b64_stream[char_offset:hdr_end])
+    # 1. 헤더 크기를 파악하기 위해 안전하게 맨 앞부분 일부만 디코딩 (줄바꿈 무시)
+    temp_chunk = b64_stream[char_offset:char_offset + 100].translate(None, b" \n\r\t")
+    pad_temp = (4 - len(temp_chunk) % 4) % 4
+    temp_dec = base64.b64decode(temp_chunk + b"=" * pad_temp)
+    
+    n_blocks = struct.unpack_from(hfmt, temp_dec, 0)[0]
+    hbytes = (3 + n_blocks) * hsz
+    
+    # 헤더만 단독으로 인코딩되었을 때 패딩을 포함한 Base64 길이
+    header_b64_chars = ((hbytes + 2) // 3) * 4  
 
-    # 헤더 파싱
-    n_blocks   = struct.unpack_from(hfmt, hdr_raw, 0)[0]
+    # 2. 헤더의 comp_sizes 전체를 파싱하기 위해 정확한 길이만큼 다시 디코딩
+    hdr_chunk = b64_stream[char_offset:char_offset + header_b64_chars + 100].translate(None, b" \n\r\t")[:header_b64_chars]
+    hdr_pad = (4 - len(hdr_chunk) % 4) % 4
+    hdr_raw = base64.b64decode(hdr_chunk + b"=" * hdr_pad)
+
     comp_sizes = [struct.unpack_from(hfmt, hdr_raw, (3 + i) * hsz)[0]
                   for i in range(n_blocks)]
     total_comp = sum(comp_sizes)
-    hbytes     = (3 + n_blocks) * hsz
+    data_b64_chars = ((total_comp + 2) // 3) * 4 # 압축 데이터의 Base64 길이
 
-    # 데이터 위치 결정
-    if len(hdr_raw) > hbytes:
-        # 헤더와 데이터가 같은 서브블록 (offset=0 패턴)
-        data_bytes = hdr_raw[hbytes:]
+    # 3. 전체 필요한 유효 Base64 문자 수(헤더 + 데이터)만큼 넉넉하게 추출
+    total_b64_chars_needed = header_b64_chars + data_b64_chars
+    extract_len = int(total_b64_chars_needed * 1.5) + 100 
+    clean_stream = b64_stream[char_offset:char_offset + extract_len].translate(None, b" \n\r\t")
+    
+    # 만약 여유를 줬는데도 띄어쓰기/줄바꿈이 너무 많아 유효 문자가 부족하다면 연장
+    while len(clean_stream) < total_b64_chars_needed and extract_len < len(b64_stream) - char_offset:
+        extract_len += data_b64_chars
+        clean_stream = b64_stream[char_offset:char_offset + extract_len].translate(None, b" \n\r\t")
+
+    # 4. 분석된 VTK 블록 분리 구조(==)에 따른 동적 파싱 로직
+    # 헤더 영역의 Base64 문자열 내에 패딩(=)이 포함되어 있다면 헤더와 데이터가 쪼개진 것
+    if b"=" in clean_stream[:header_b64_chars]:
+        # [블록 1, 2 패턴 (분리형)] 
+        # 중간에 낀 패딩 마커(=)를 모두 지우고, 순수 데이터 Base64 문자만 도출
+        clean_stream_no_pad = clean_stream.replace(b"=", b"")
+        h_chars_no_pad = (hbytes * 4 + 2) // 3  # 패딩을 제외한 헤더 Base64 길이
+        
+        data_chunk = clean_stream_no_pad[h_chars_no_pad : h_chars_no_pad + data_b64_chars]
+        pad = (4 - len(data_chunk) % 4) % 4
+        data_bytes = base64.b64decode(data_chunk + b"=" * pad)
     else:
-        # 데이터가 바로 다음 서브블록
-        data_start  = hdr_end
-        needed_chars = ((total_comp + 2) // 3) * 4
-        chunk = b64_stream[data_start:data_start + needed_chars]
-        pad   = (4 - len(chunk) % 4) % 4
-        data_bytes = base64.b64decode(chunk + b"=" * pad)
+        # [블록 0 패턴 (병합형)]
+        # 전체를 통째로 디코딩한 뒤 바이트 단위에서 헤더(hbytes) 이후를 잘라냄
+        merged_chunk_len = ((hbytes + total_comp + 2) // 3) * 4
+        merged_chunk = clean_stream[:merged_chunk_len]
+        pad = (4 - len(merged_chunk) % 4) % 4
+        merged_raw = base64.b64decode(merged_chunk + b"=" * pad)
+        
+        data_bytes = merged_raw[hbytes:]
 
-    # zlib 해제
+    # 5. zlib 해제
     pos, out = 0, b""
     for cs in comp_sizes:
         out += zlib.decompress(data_bytes[pos:pos + cs])
         pos += cs
+        
     return out
 
 
