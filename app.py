@@ -505,8 +505,12 @@ init_state()
 #  사이드바
 # ══════════════════════════════════════════════════════════
 with st.sidebar:
-    # Language fixed to English
-    T = TRANSLATIONS.get("English", TRANSLATIONS["English"])
+    # 언어 설정
+    st.markdown("### 🌐 Language Settings")
+    lang = st.selectbox("Select Language",
+        ["English", "한국어", "Español", "日本語", "中文", "Français", "हिन्दी"],
+        index=0, key="lang_select")
+    T = TRANSLATIONS.get(lang, TRANSLATIONS["English"])
 
     st.markdown("## 🔩 MOLDIQ")
     st.markdown(f'<div class="mono" style="color:#55667a;font-size:0.65rem;">{T["platform_desc"]}</div>',
@@ -558,8 +562,8 @@ with st.sidebar:
         else:
             st.warning(T.get("warn_run_st2_first", "Please run Stage 2 first."))
 
-# Language fixed to English globally
-T = TRANSLATIONS.get("English", TRANSLATIONS["English"])
+# ── 언어 객체 (사이드바 밖에서도 사용) ───────────────────
+T = TRANSLATIONS.get(st.session_state.get("lang_select", "English"), TRANSLATIONS["English"])
 
 # ══════════════════════════════════════════════════════════
 #  공통 유틸
@@ -591,28 +595,28 @@ def _check_github_secrets() -> bool:
 
 def _show_github_token_guide():
     """GitHub Token 미설정 시 단계별 안내 UI 표시."""
-    st.error("🔑 **GITHUB_TOKEN is not configured.**")
-    with st.expander("📋 Setup Instructions — Click to expand", expanded=True):
+    st.error("🔑 **GITHUB_TOKEN이 설정되지 않았습니다.**")
+    with st.expander("📋 설정 방법 — 클릭해서 펼치기", expanded=True):
         st.markdown("""
-**For Streamlit Cloud:**
-1. [share.streamlit.io](https://share.streamlit.io) → App → ⋯ menu → **Edit secrets**
-2. Paste the following and replace the token value:
+**Streamlit Cloud를 사용하는 경우:**
+1. [share.streamlit.io](https://share.streamlit.io) → 앱 → ⋯ 메뉴 → **Edit secrets**
+2. 아래 내용을 붙여넣고 토큰값만 교체:
 
 ```toml
-GITHUB_TOKEN           = "ghp_YOUR_TOKEN_HERE"
-OPENFOAM_REPO_OWNER    = "workshopcompany"
-OPENFOAM_REPO_NAME     = "OpenFOAM-Injection-Automation"
+GITHUB_TOKEN        = "ghp_YOUR_TOKEN_HERE"
+OPENFOAM_REPO_OWNER = "workshopcompany"
+OPENFOAM_REPO_NAME  = "OpenFOAM-Injection-Automation"
 ```
 
-**For local execution:**
-Create `.streamlit/secrets.toml` in your project root with the content above.
+**로컬 실행의 경우:**
+프로젝트 루트 `.streamlit/secrets.toml` 파일을 위 내용으로 생성.
 
-**Generate a GitHub Token:**
+**GitHub Token 발급:**
 GitHub → Settings → Developer settings → Personal access tokens → Generate new token (classic)
-→ Check `repo` scope → Copy the generated token
+→ `repo` 권한 체크 → 생성된 토큰 복사
 
 ---
-💡 **Use without GitHub:** Load results via **Option C** (direct VTK file upload) below.
+💡 **GitHub 없이 바로 사용:** 아래 **Option C** (VTK 파일 직접 업로드)로 결과를 로드하세요.
         """)
 
 
@@ -963,100 +967,98 @@ elif current_stage == "stage1":
             st.markdown("""
             **Step 1:** Run simulation at
             [🚀 MIM-Ops Pro](https://openfoam-injection-automation.streamlit.app/)
-            → Return here after simulation completes.
+            → 시뮬레이션 완료 후 돌아오세요.
 
-            **Step 2:** Enter Signal ID below and click **Generate CSV**.
+            **Step 2:** Signal ID를 아래에 입력하고 **Generate CSV** 클릭.
             """)
 
-            with st.expander("❓ Where do I find my Signal ID?", expanded=False):
+            with st.expander("❓ Signal ID는 어디서 확인하나요?", expanded=False):
                 st.markdown("""
-                GitHub `OpenFOAM-Injection-Automation` repo → **Actions** tab
-                → Click completed workflow → Check artifact name in Artifacts section:
+                GitHub `OpenFOAM-Injection-Automation` 저장소 → **Actions** 탭
+                → 완료된 워크플로 클릭 → Artifacts 섹션에서 이름 확인:
                 ```
                 simulation-47664275
                 ```
-                All of the following formats **work**:
+                아래 형식 **모두 동작**합니다:
 
-                | Input Format | Example |
+                | 입력 형식 | 예시 |
                 |---|---|
-                | Numeric ID only | `47664275` |
-                | Full artifact name | `simulation-47664275` |
-                | Auto-select latest | `latest` |
+                | 숫자 ID만 | `47664275` |
+                | 전체 아티팩트 이름 | `simulation-47664275` |
+                | 가장 최근 결과 자동 선택 | `latest` |
                 """)
 
             # ── 진단 버튼 ──────────────────────────────────────────
-            if st.button("🔍 Check Artifact List", help="Fetch artifact list from GitHub to verify Signal IDs"):
+            if st.button("🔍 아티팩트 목록 확인", help="GitHub에서 실제 아티팩트 목록을 가져와 Signal ID를 직접 확인합니다"):
 
                 def _fetch_artifacts_direct(per_page: int = 50) -> list:
-                    """Fetch artifact list directly via GitHub API."""
-                    # flow_csv_generator._get_token()과 동일한 방식
-                    token = ""
+                    """GitHub API로 artifacts 목록 직접 조회."""
                     try:
-                        token = st.secrets.get("GITHUB_TOKEN", "")
-                    except Exception:
-                        pass
-                    if not token:
-                        token = os.environ.get("GITHUB_TOKEN", "")
-                    if not token or str(token).strip() in ("", "ghp_YOUR_TOKEN_HERE", "ghp_xxxxxxxxxxxx"):
-                        raise RuntimeError("GITHUB_TOKEN not found. Check secrets or environment variables.")
+                        # 1. 토큰 및 설정 로드
+                        token = st.secrets["GITHUB_TOKEN"]
+                        
+                        # 요청하신대로 workshopcompany와 해당 레포지토리로 설정
+                        # secrets에 설정값이 있으면 그것을 쓰고, 없으면 기본값(workshopcompany)을 사용합니다.
+                        owner = st.secrets.get("OPENFOAM_REPO_OWNER") or st.secrets.get("REPO_OWNER") or "workshopcompany"
+                        repo  = st.secrets.get("OPENFOAM_REPO_NAME")  or st.secrets.get("REPO_NAME")  or "OpenFOAM-Injection-Automation"
+                        
+                    except (KeyError, FileNotFoundError):
+                        raise RuntimeError("GITHUB_TOKEN이 .streamlit/secrets.toml에 없습니다.")
 
-                    owner = ""
-                    try:
-                        owner = st.secrets.get("OPENFOAM_REPO_OWNER", st.secrets.get("REPO_OWNER", ""))
-                    except Exception:
-                        pass
-                    if not owner:
-                        owner = os.environ.get("OPENFOAM_REPO_OWNER", os.environ.get("REPO_OWNER", "workshopcompany"))
-
-                    repo = ""
-                    try:
-                        repo = st.secrets.get("OPENFOAM_REPO_NAME", st.secrets.get("REPO_NAME", ""))
-                    except Exception:
-                        pass
-                    if not repo:
-                        repo = os.environ.get("OPENFOAM_REPO_NAME", os.environ.get("REPO_NAME", "OpenFOAM-Injection-Automation"))
-
+                    # 2. GitHub API 호출 (최신순 조회를 위해 per_page 상향)
                     url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
                     headers = {
                         "Authorization": f"Bearer {token}",
                         "Accept": "application/vnd.github+json",
                         "X-GitHub-Api-Version": "2022-11-28"
                     }
+                    
                     try:
-                        resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=15)
+                        # 최신 아티팩트를 먼저 확인하기 위해 쿼리 매개변수 확인
+                        resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=10)
+                        
                         if resp.status_code == 401:
-                            raise RuntimeError(f"Token rejected (401). Check that GITHUB_TOKEN is valid and has 'repo' scope. Repo: {owner}/{repo}")
+                            raise RuntimeError("GITHUB_TOKEN이 유효하지 않거나 권한이 없습니다 (401).")
                         if resp.status_code == 404:
-                            raise RuntimeError(f"Repository not found: {owner}/{repo} (404). Check OPENFOAM_REPO_OWNER and OPENFOAM_REPO_NAME in secrets.")
+                            raise RuntimeError(f"저장소를 찾을 수 없습니다: {owner}/{repo} (404)")
+                        
                         resp.raise_for_status()
                         return resp.json().get("artifacts", [])
                     except requests.exceptions.RequestException as e:
-                        raise RuntimeError(f"GitHub connection failed: {str(e)}")
+                        raise RuntimeError(f"GitHub 연결 실패: {str(e)}")
 
-                # ── 바로 시도 — pre-check 없이 직접 fetch ──
-                try:
-                    with st.spinner("Fetching simulation result list from GitHub..."):
-                        artifacts = _fetch_artifacts_direct(per_page=30)
-
-                    if artifacts:
-                        st.success(f"✅ Found {len(artifacts)} simulation result(s)")
-                        st.info("Copy the part after 'simulation-' (e.g. cf22322a) from the Artifact Name column below and use it as your Signal ID.")
-                        display_data = []
-                        for a in artifacts:
-                            display_data.append({
-                                "Artifact Name": a["name"],
-                                "Created At": a["created_at"].replace("T", " ").replace("Z", ""),
-                                "Size (MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
-                                "Status": "Available" if not a.get("expired") else "Expired"
-                            })
-                        st.dataframe(display_data, use_container_width=True, hide_index=True)
-                    else:
-                        st.warning("⚠️ No artifacts found. Check that your GitHub Actions simulation has completed.")
-
-                except RuntimeError as e:
-                    st.error(f"❌ {e}")
-                except Exception as e:
-                    st.error(f"❌ Unexpected error: {e}")
+                # --- 버튼 클릭 시 실행 로직 ---
+                if not _check_github_secrets(): # 기존 코드에 있는 체크 함수 호출
+                    _show_github_token_guide()
+                else:
+                    try:
+                        with st.spinner("GitHub에서 시뮬레이션 결과 목록을 가져오는 중..."):
+                            artifacts = _fetch_artifacts_direct(per_page=30)
+                        
+                        if artifacts:
+                            st.success(f"✅ {len(artifacts)}개의 시뮬레이션 결과 발견")
+                            st.info("아래 목록의 '아티팩트 이름'에서 'simulation-' 뒤의 문구(예: cf22322a)를 Signal ID에 입력하세요.")
+                            
+                            # 사용자에게 보여줄 데이터 프레임 구성
+                            display_data = []
+                            for a in artifacts:
+                                # 'simulation-'으로 시작하는 파일만 필터링하거나 강조할 수 있습니다.
+                                display_data.append({
+                                    "아티팩트 이름": a["name"],
+                                    "생성일": a["created_at"].replace("T", " ").replace("Z", ""),
+                                    "크기(MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
+                                    "상태": "사용 가능" if not a.get("expired") else "만료됨"
+                                })
+                            
+                            st.dataframe(display_data, use_container_width=True, hide_index=True)
+                        else:
+                            st.warning("⚠️ 아티팩트가 없습니다. GitHub Actions에서 시뮬레이션이 완료되었는지 확인하세요.")
+                            
+                    except RuntimeError as e:
+                        st.error(str(e))
+                        _show_github_token_guide()
+                    except Exception as e:
+                        st.error(f"❌ 예상치 못한 오류: {e}")
 
             st.divider()
 
@@ -1066,8 +1068,8 @@ elif current_stage == "stage1":
                 signal_id = st.text_input(
                     "Signal ID (from MIM-Ops simulation)",
                     value=st.session_state.get("github_sim_signal_id", ""),
-                    placeholder="e.g. 47664275  or  simulation-47664275  or  latest",
-                    help="Numeric ID, full artifact name, or 'latest'",
+                    placeholder="예: 47664275  또는  simulation-47664275  또는  latest",
+                    help="숫자 ID, 전체 아티팩트 이름, 또는 'latest' 입력 가능",
                 )
             with sig_col2:
                 st.write("")
@@ -1076,42 +1078,48 @@ elif current_stage == "stage1":
 
             if gen_btn:
                 if not signal_id.strip():
-                    st.warning("Please enter a Signal ID. Use the 'Check Artifact List' button above if unsure.")
+                    st.warning("Signal ID를 입력하세요. 모르면 위 '아티팩트 목록 확인' 버튼을 먼저 누르세요.")
                 else:
-                    with st.spinner(f"Loading results for '{signal_id.strip()}'..."):
-                        try:
-                            cae_df = generate_flow_csv_from_github(signal_id.strip())
-                            st.session_state["cae_df"] = cae_df
-                            st.session_state["github_sim_signal_id"] = signal_id.strip()
-                            st.session_state["flow_csv_ready"] = True
-                            st.success(
-                                f"✅ Loaded! {len(cae_df):,} points | "
-                                f"Material: {cae_df['material'].iloc[0]} | "
-                                f"Max Pressure: {cae_df['pressure'].max():.1f} MPa"
-                            )
-                        except FileNotFoundError as e:
-                            st.error(str(e))
-                        except Exception as e:
-                            _emsg = str(e)
-                            st.error(f"❌ Error: {_emsg}")
+                    _github_ok = _check_github_secrets()
+                    if not _github_ok:
+                        _show_github_token_guide()
+                    else:
+                        with st.spinner(f"'{signal_id.strip()}' 결과 가져오는 중..."):
+                            try:
+                                cae_df = generate_flow_csv_from_github(signal_id.strip())
+                                st.session_state["cae_df"] = cae_df
+                                st.session_state["github_sim_signal_id"] = signal_id.strip()
+                                st.session_state["flow_csv_ready"] = True
+                                st.success(
+                                    f"✅ 로드 완료! {len(cae_df):,}개 포인트 | "
+                                    f"재료: {cae_df['material'].iloc[0]} | "
+                                    f"최대 압력: {cae_df['pressure'].max():.1f} MPa"
+                                )
+                            except FileNotFoundError as e:
+                                st.error(str(e))
+                            except Exception as e:
+                                _emsg = str(e)
+                                st.error(f"❌ 오류: {_emsg}")
+                                if "GITHUB_TOKEN" in _emsg or "token" in _emsg.lower():
+                                    _show_github_token_guide()
 
             if st.session_state.get("flow_csv_ready") and st.session_state.get("cae_df") is not None:
                 df_preview = st.session_state["cae_df"]
-                st.markdown("**Data Preview (top 5 rows)**")
+                st.markdown("**데이터 미리보기 (상위 5행)**")
                 st.dataframe(df_preview.head(5), use_container_width=True)
                 col_s1, col_s2, col_s3 = st.columns(3)
-                col_s1.metric("Total Points", f"{len(df_preview):,}")
-                col_s2.metric("Max Pressure", f"{df_preview['pressure'].max():.1f} MPa")
-                col_s3.metric("Fill Time", f"{df_preview['fill_time'].max():.3f} s")
+                col_s1.metric("총 포인트", f"{len(df_preview):,}")
+                col_s2.metric("최대 압력", f"{df_preview['pressure'].max():.1f} MPa")
+                col_s3.metric("충진 시간", f"{df_preview['fill_time'].max():.3f} s")
                 csv_bytes = df_preview.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("💾 Download CSV", csv_bytes, "flow_analysis.csv", "text/csv",
+                st.download_button("💾 CSV 다운로드", csv_bytes, "flow_analysis.csv", "text/csv",
                                    use_container_width=True)
 
         # ── Option B: 수동 CSV 업로드 ────────────────────────────────
         with st.expander("📄 Option B — Manual CSV Upload"):
             st.markdown("""
-            **Required columns:** `x, y, pressure(MPa), temperature(°C), fill_time(s)`
-            `z` column is optional (enables 3D visualization)
+            **필수 컬럼:** `x, y, pressure(MPa), temperature(°C), fill_time(s)`
+            `z` 컬럼은 선택 (있으면 3D 시각화)
             """)
             uploaded = st.file_uploader(T.get("select_cae_file", "CAE CSV 파일 선택"), type=["csv"])
             use_sample = st.checkbox(T["use_sample"], value=False)
@@ -1121,35 +1129,35 @@ elif current_stage == "stage1":
                     _df_b = load_cae_data(uploaded)
                     st.session_state["cae_df"] = _df_b
                     st.session_state["flow_csv_ready"] = True
-                    st.success(f"✅ CSV loaded! {len(_df_b):,} points | Max Pressure: {_df_b['pressure'].max():.1f} MPa")
+                    st.success(f"✅ CSV 로드 완료! {len(_df_b):,}개 포인트 | 최대 압력: {_df_b['pressure'].max():.1f} MPa")
                 except Exception as _e:
                     st.error(f"CSV 파싱 오류: {_e}")
 
         # ── Option C: VTK 파일 직접 업로드 (FIX-1 + FIX-3) ─────────
-        with st.expander("🗂️ Option C — Direct VTK/VTU Upload (OpenFOAM Results)", expanded=False):
+        with st.expander("🗂️ Option C — VTK/VTU 파일 직접 업로드 (OpenFOAM 결과)", expanded=False):
             st.markdown("""
-            **Upload your OpenFOAM `foamToVTK` output directly.**
-            - **ZIP file** (containing `internal.vtu`): Compress the entire simulation result folder
-            - **Single VTU file** (`internal.vtu`): Internal solid mesh data
+            **OpenFOAM `foamToVTK` 결과물을 직접 업로드하세요.**
+            - **ZIP 파일** (`internal.vtu` 포함): 시뮬레이션 결과 폴더 전체를 압축한 .zip
+            - **단일 VTU 파일** (`internal.vtu`): 내부 솔리드 메쉬 데이터
 
-            > 📌 CSV is auto-generated from actual OpenFOAM computed values (pressure p, velocity U, etc.)
+            > 📌 업로드하면 압력(p), 속도(U) 등 **실제 OpenFOAM 계산값**으로 CSV가 자동 생성됩니다.
             """)
 
             vtk_col1, vtk_col2 = st.columns([3, 1])
             with vtk_col1:
                 vtk_upload = st.file_uploader(
-                    "Select VTK Result File",
+                    "VTK 결과 파일 선택",
                     type=["zip", "vtu", "vtm", "vtp"],
                     key="vtk_direct_uploader",
-                    help="ZIP: compress full folder | .vtu: upload internal.vtu directly",
+                    help="ZIP: 폴더 전체 압축 | .vtu: internal.vtu 개별 업로드",
                 )
             with vtk_col2:
                 st.write(""); st.write("")
-                vtk_gen_btn = st.button("🔄 Convert VTK → CSV", key="vtk_gen_btn",
+                vtk_gen_btn = st.button("🔄 VTK → CSV 변환", key="vtk_gen_btn",
                                         use_container_width=True, type="primary")
 
             if vtk_upload and vtk_gen_btn:
-                with st.spinner("Parsing VTK file..."):
+                with st.spinner("VTK 파일 파싱 중..."):
                     try:
                         raw = vtk_upload.getvalue()
                         ext = vtk_upload.name.lower().split(".")[-1]
@@ -1163,25 +1171,25 @@ elif current_stage == "stage1":
                         st.session_state["flow_csv_ready"] = True
                         st.session_state["vtk_solid_df"]  = _vtk_df  # Solid Mesh 탭용
                         st.success(
-                            f"✅ VTK parsed! **{len(_vtk_df):,} points** | "
-                            f"Max Pressure: {_vtk_df['pressure'].max():.3f} MPa | "
-                            f"File: {vtk_upload.name}"
+                            f"✅ VTK 파싱 완료! **{len(_vtk_df):,}개 포인트** | "
+                            f"최대 압력: {_vtk_df['pressure'].max():.3f} MPa | "
+                            f"파일: {vtk_upload.name}"
                         )
                         # CSV 다운로드 버튼
                         csv_vtk = _vtk_df.to_csv(index=False).encode("utf-8-sig")
                         st.download_button(
-                            "💾 Download Generated CSV",
+                            "💾 생성된 CSV 다운로드",
                             csv_vtk, "vtk_flow_results.csv", "text/csv",
                             use_container_width=True,
                         )
                     except Exception as _ve:
-                        st.error(f"❌ VTK parse error: {_ve}")
-                        st.info("💡 Check file format. Only ASCII .vtu is supported. (`foamToVTK -ascii`)")
+                        st.error(f"❌ VTK 파싱 오류: {_ve}")
+                        st.info("💡 파일 형식을 확인하세요. ASCII 형식 .vtu만 지원합니다. (`foamToVTK -ascii`)")
 
             # 이미 VTK 데이터가 로드된 경우 상태 표시
             if st.session_state.get("vtk_solid_df") is not None:
                 _vs = st.session_state["vtk_solid_df"]
-                st.info(f"🧊 Solid Mesh data loaded: {len(_vs):,} pts — check the 'Solid Mesh (VTK)' tab.")
+                st.info(f"🧊 Solid Mesh 데이터 로드됨: {len(_vs):,} pts — 'Solid Mesh (VTK)' 탭에서 확인하세요.")
 
 
 
@@ -1373,7 +1381,7 @@ elif current_stage == "stage1":
                     st.success(f"✅ {stl_mesh_data['name']}\n({stl_mesh_data['n_faces']:,} faces)")
 
             if stl_upload_field is not None:
-                with st.spinner("Parsing STL..."):
+                with st.spinner("STL 파싱 중..."):
                     try:
                         file_bytes = stl_upload_field.read()
                         verts, faces = _parse_stl_binary(file_bytes)
@@ -1420,177 +1428,6 @@ elif current_stage == "stage1":
                     showlegend=True,
                 )
 
-            # flow_weight 컬럼 존재 = solver 실좌표 데이터 → Cell Mesh 렌더링 가능
-            _has_voxel_data = "flow_weight" in cae_df.columns
-
-            # ══ Cell Mesh 빌더 — CAE 포인트 → 진짜 3D 솔리드 셀 Mesh3d ═══
-            def _build_cell_mesh(df_in, field_col, max_pts=8000):
-                """
-                CAE 포인트 클라우드 → 진짜 3D 솔리드 셀 메쉬 (Moldflow 스타일).
-
-                핵심 전략:
-                  XYZ 3차원 격자(voxel grid)를 생성.
-                  데이터가 있는 voxel만 추출 → 각 voxel의 6개 면(quad→2tri)으로
-                  Mesh3d 구성 → 각 face가 독립된 필드 색상을 가진 솔리드 덩어리.
-
-                Z 범위가 매우 얇으면(판형) XY 격자 + 위/아래 두 면으로 두께를 주어
-                납작한 2D 처럼 보이지 않게 처리.
-                """
-                _df = df_in.copy()
-                if len(_df) == 0:
-                    return None
-
-                # ── 좌표 추출 ─────────────────────────────────────────────
-                x_arr = _df["x"].values.astype(float)
-                y_arr = _df["y"].values.astype(float)
-                has_z = "z" in _df.columns
-                z_arr = _df["z"].values.astype(float) if has_z else np.zeros(len(_df))
-                v_arr = _df[field_col].values.astype(float)
-
-                # Z 범위 확인 — 너무 얇으면 인위적으로 두께 부여
-                z_range = float(z_arr.max() - z_arr.min())
-                xy_range = max(float(x_arr.max() - x_arr.min()),
-                               float(y_arr.max() - y_arr.min()), 1e-6)
-                _flat = z_range < xy_range * 0.05   # XY 대비 5% 미만이면 "납작"
-
-                if _flat:
-                    # Z가 없거나 너무 얇음 → 인위적으로 두께 추가
-                    z_mid  = float(z_arr.mean())
-                    z_half = xy_range * 0.04          # XY 대비 4% 두께
-                    z_arr  = np.where(z_arr <= z_mid, z_mid - z_half, z_mid + z_half)
-
-                # ── 3D 격자 해상도 결정 ────────────────────────────────────
-                # 총 voxel 수 ≤ max_pts 가 되도록 nx, ny, nz 배분
-                x_span = float(x_arr.max() - x_arr.min()) or 1.0
-                y_span = float(y_arr.max() - y_arr.min()) or 1.0
-                z_span = float(z_arr.max() - z_arr.min()) or 1.0
-
-                # 비례 배분
-                vol_cbrt = (max_pts) ** (1/3)
-                scale = (x_span * y_span * z_span) ** (1/3) or 1.0
-                nx = max(4, int(vol_cbrt * x_span / scale))
-                ny = max(4, int(vol_cbrt * y_span / scale))
-                nz = max(2, int(vol_cbrt * z_span / scale))
-                # 너무 커지지 않게 클램프
-                nx = min(nx, 60); ny = min(ny, 60); nz = min(nz, 20)
-
-                x_bins = np.linspace(x_arr.min(), x_arr.max(), nx + 1)
-                y_bins = np.linspace(y_arr.min(), y_arr.max(), ny + 1)
-                z_bins = np.linspace(z_arr.min(), z_arr.max(), nz + 1)
-
-                # ── 각 포인트를 voxel에 배정 ──────────────────────────────
-                xi = np.clip(np.digitize(x_arr, x_bins) - 1, 0, nx - 1)
-                yi = np.clip(np.digitize(y_arr, y_bins) - 1, 0, ny - 1)
-                zi = np.clip(np.digitize(z_arr, z_bins) - 1, 0, nz - 1)
-
-                vox_val = np.full((nx, ny, nz), np.nan)
-                vox_cnt = np.zeros((nx, ny, nz), dtype=int)
-                for idx in range(len(_df)):
-                    ii, jj, kk = xi[idx], yi[idx], zi[idx]
-                    if np.isnan(vox_val[ii, jj, kk]):
-                        vox_val[ii, jj, kk] = v_arr[idx]
-                    else:
-                        vox_val[ii, jj, kk] += v_arr[idx]
-                    vox_cnt[ii, jj, kk] += 1
-
-                filled = vox_cnt > 0
-                vox_val[filled] /= vox_cnt[filled]
-
-                # 빈 voxel 이웃 보간 (최대 3회, 26-이웃 vectorized)
-                for _ in range(3):
-                    empty = np.isnan(vox_val)
-                    if not empty.any():
-                        break
-                    pad = np.pad(vox_val, 1, constant_values=np.nan)
-                    s_sum = np.zeros((nx, ny, nz))
-                    s_cnt = np.zeros((nx, ny, nz))
-                    for di in range(3):
-                        for dj in range(3):
-                            for dk in range(3):
-                                if di == 1 and dj == 1 and dk == 1:
-                                    continue
-                                sl = pad[di:di+nx, dj:dj+ny, dk:dk+nz]
-                                valid = ~np.isnan(sl)
-                                s_sum += np.where(valid, sl, 0)
-                                s_cnt += valid.astype(float)
-                    fm = empty & (s_cnt > 0)
-                    vox_val[fm] = s_sum[fm] / s_cnt[fm]
-
-                # ── Voxel 면(face) → Mesh3d 삼각형 생성 ──────────────────
-                # 구조: quad 1개 = 4 vertex + 2 triangle (tri1: 0,1,2 / tri2: 0,2,3)
-                # 각 quad는 독립된 4 vertex를 가짐 (인덱스 충돌 없음)
-                # intensitymode="cell" → triangle 수 = len(i) = n_quads * 2
-                # intensity 배열 길이도 반드시 n_quads * 2 이어야 함
-
-                cx = (x_bins[:-1] + x_bins[1:]) / 2
-                cy = (y_bins[:-1] + y_bins[1:]) / 2
-                cz = (z_bins[:-1] + z_bins[1:]) / 2
-                dx2 = (x_bins[1] - x_bins[0]) / 2
-                dy2 = (y_bins[1] - y_bins[0]) / 2
-                dz2 = (z_bins[1] - z_bins[0]) / 2
-
-                # 6면 정의 (quad 코너 4개 오프셋)
-                face_defs = [
-                    [( dx2,-dy2,-dz2),( dx2, dy2,-dz2),( dx2, dy2, dz2),( dx2,-dy2, dz2)],  # +X
-                    [(-dx2, dy2,-dz2),(-dx2,-dy2,-dz2),(-dx2,-dy2, dz2),(-dx2, dy2, dz2)],  # -X
-                    [( dx2, dy2,-dz2),(-dx2, dy2,-dz2),(-dx2, dy2, dz2),( dx2, dy2, dz2)],  # +Y
-                    [(-dx2,-dy2,-dz2),( dx2,-dy2,-dz2),( dx2,-dy2, dz2),(-dx2,-dy2, dz2)],  # -Y
-                    [(-dx2,-dy2, dz2),( dx2,-dy2, dz2),( dx2, dy2, dz2),(-dx2, dy2, dz2)],  # +Z
-                    [(-dx2, dy2,-dz2),( dx2, dy2,-dz2),( dx2,-dy2,-dz2),(-dx2,-dy2,-dz2)],  # -Z
-                ]
-                neighbor_offsets = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
-
-                active = np.argwhere(~np.isnan(vox_val))
-
-                # 결과 누적 리스트
-                all_vx, all_vy, all_vz = [], [], []
-                tri_ii, tri_jj, tri_kk = [], [], []
-                tri_vals = []   # triangle당 하나의 값 (intensitymode="cell")
-                n_quads_added = 0
-
-                for (ii, jj, kk) in active:
-                    v_center = float(vox_val[ii, jj, kk])
-                    ox, oy, oz = float(cx[ii]), float(cy[jj]), float(cz[kk])
-
-                    for face_idx, corners in enumerate(face_defs):
-                        ni = ii + neighbor_offsets[face_idx][0]
-                        nj = jj + neighbor_offsets[face_idx][1]
-                        nk = kk + neighbor_offsets[face_idx][2]
-                        # 내부면(이웃이 채워진 면) 스킵
-                        if (0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz
-                                and not np.isnan(vox_val[ni, nj, nk])):
-                            continue
-
-                        # 4 vertex 추가 (quad당 독립 4개)
-                        base = n_quads_added * 4
-                        for cx_, cy_, cz_ in corners:
-                            all_vx.append(ox + cx_)
-                            all_vy.append(oy + cy_)
-                            all_vz.append(oz + cz_)
-
-                        # tri1: base+0, base+1, base+2
-                        tri_ii.append(base);     tri_jj.append(base+1); tri_kk.append(base+2)
-                        tri_vals.append(v_center)
-                        # tri2: base+0, base+2, base+3
-                        tri_ii.append(base);     tri_jj.append(base+2); tri_kk.append(base+3)
-                        tri_vals.append(v_center)
-
-                        n_quads_added += 1
-
-                if n_quads_added == 0:
-                    return None
-
-                return {
-                    "x": np.array(all_vx, dtype=np.float32),
-                    "y": np.array(all_vy, dtype=np.float32),
-                    "z": np.array(all_vz, dtype=np.float32),
-                    "i": np.array(tri_ii, dtype=np.int32),
-                    "j": np.array(tri_jj, dtype=np.int32),
-                    "k": np.array(tri_kk, dtype=np.int32),
-                    "facecolor": np.array(tri_vals, dtype=np.float32),
-                    "n_cells": n_quads_added,
-                }
-
             for i, ftab in enumerate(field_tabs):
                 ft = fields[i]
                 with ftab:
@@ -1600,69 +1437,16 @@ elif current_stage == "stage1":
 
                     fig3d = go.Figure()
 
-                    # ══ 분기 1: CAE 포인트 → Cell Mesh (Moldflow 스타일) ═════
-                    if _has_voxel_data:
-                        cell_data = _build_cell_mesh(cae_df, ft, max_pts=6000)
-
-                        if cell_data is not None:
-                            # facecolor(face별 flat 색상)을 intensity로 사용하려면
-                            # vertex 수 = len(x), face intensity = facecolor
-                            # Plotly Mesh3d는 intensitymode="cell" 지원 (vertex count = n_faces)
-                            # → facecolor 배열은 face 수와 동일해야 함
-                            # → intensitymode="vertex" + vertex-level intensity 사용 (smooth)
-                            # → intensitymode="cell" + facecolor 배열 사용 (flat, Moldflow)
-
-                            fig3d.add_trace(go.Mesh3d(
-                                x=cell_data["x"],
-                                y=cell_data["y"],
-                                z=cell_data["z"],
-                                i=cell_data["i"],
-                                j=cell_data["j"],
-                                k=cell_data["k"],
-                                intensity=cell_data["facecolor"],   # face당 하나의 값
-                                intensitymode="cell",               # ← Moldflow 스타일: 셀마다 독립 색상
-                                colorscale=colorscales[ft],
-                                colorbar=dict(
-                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
-                                    tickfont=dict(color="#e2e8f0"), x=1.02,
-                                ),
-                                opacity=1.0,
-                                flatshading=True,                   # flat → 각 셀이 단색으로 채워짐
-                                lighting=dict(ambient=0.9, diffuse=0.3,
-                                              specular=0.0, roughness=1.0),
-                                name=f"{field_options[ft]} (Cell Mesh)",
-                                showlegend=True,
-                                hovertemplate=(
-                                    f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
-                                    "X: %{x:.2f} mm | Y: %{y:.2f} mm"
-                                    "<extra></extra>"
-                                ),
-                            ))
-                            _render_label = f"Cell Mesh ({cell_data['n_cells']:,} cells)"
-                        else:
-                            st.warning("Cell mesh generation failed — please check your data.")
-                            _render_label = "Cell Mesh (error)"
-
-                        # 유동선단 오버레이 (fill_time 탭)
-                        if ft == "fill_time" and len(front_df) > 0:
-                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
-                            fig3d.add_trace(go.Scatter3d(
-                                x=front_df["x"], y=front_df["y"], z=fz,
-                                mode="markers",
-                                marker=dict(size=4, color="#00ffcc", opacity=0.9,
-                                            line=dict(color="#ffffff", width=0.5)),
-                                name="🟢 Flow Front (>85%)", showlegend=True,
-                            ))
-
-                    # ══ 분기 2: STL 있으면 Mesh3d ════════════════════════════
-                    elif stl_mesh_data is not None:
+                    # ── 분기: STL 있으면 Mesh3d, 없으면 개선된 Scatter3d ──
+                    if stl_mesh_data is not None:
                         verts  = stl_mesh_data["vertices"]
                         faces  = stl_mesh_data["faces"]
 
+                        # 인텐시티 캐시 (재계산 방지)
                         if ft not in stl_mesh_data.get("intensity_cache", {}):
                             with st.spinner(f"🔄 {field_options[ft]} → Mesh 매핑 중 (최초 1회)..."):
-                                gate_pos_arr = np.array([gate_x, gate_y, gate_z])
-                                intensity = _map_cae_to_mesh(verts, cae_df, ft, gate_pos_arr)
+                                gate_pos = np.array([gate_x, gate_y, gate_z])
+                                intensity = _map_cae_to_mesh(verts, cae_df, ft, gate_pos)
                                 stl_mesh_data["intensity_cache"][ft] = intensity
                                 st.session_state["_stl_mesh_cache"] = stl_mesh_data
                         else:
@@ -1678,7 +1462,7 @@ elif current_stage == "stage1":
                                 tickfont=dict(color="#e2e8f0"), x=1.02,
                             ),
                             opacity=1.0,
-                            flatshading=False,
+                            flatshading=False,       # smooth shading
                             lighting=dict(ambient=0.5, diffuse=0.8,
                                           specular=0.3, roughness=0.5),
                             lightposition=dict(x=1, y=1, z=2),
@@ -1691,6 +1475,7 @@ elif current_stage == "stage1":
                             ),
                         ))
 
+                        # 유동선단 오버레이 (fill_time 탭)
                         if ft == "fill_time" and len(front_df) > 0:
                             fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
                             fig3d.add_trace(go.Scatter3d(
@@ -1701,60 +1486,44 @@ elif current_stage == "stage1":
                                 name="🟢 Flow Front (>85%)", showlegend=True,
                             ))
 
-                        _render_label = "Mesh3d — STL Surface"
-
-                    # ══ 분기 3: CSV/샘플 데이터 → Cell Mesh fallback ════════
                     else:
-                        # STL 없이 CSV 데이터만 있어도 Cell Mesh 적용
-                        cell_data_fb = _build_cell_mesh(cae_df, ft, max_pts=5000)
+                        # ── STL 없음: Scatter3d (개선형, 에러 없음) ─────────
+                        pt_color = cae_df[ft].values
+                        z_col = cae_df["z"].values if has_z_global else np.zeros(len(cae_df))
 
-                        if cell_data_fb is not None:
-                            fig3d.add_trace(go.Mesh3d(
-                                x=cell_data_fb["x"],
-                                y=cell_data_fb["y"],
-                                z=cell_data_fb["z"],
-                                i=cell_data_fb["i"],
-                                j=cell_data_fb["j"],
-                                k=cell_data_fb["k"],
-                                intensity=cell_data_fb["facecolor"],
-                                intensitymode="cell",
+                        if ft == "pressure":
+                            pt_size = (4 + 8 * (1 - cae_df["rel_dist"].values)).clip(4, 12).tolist()
+                        else:
+                            pt_size = 7
+
+                        fig3d.add_trace(go.Scatter3d(
+                            x=cae_df["x"], y=cae_df["y"], z=z_col,
+                            mode="markers",
+                            marker=dict(
+                                size=pt_size,
+                                color=pt_color,
                                 colorscale=colorscales[ft],
                                 colorbar=dict(
                                     title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
                                     tickfont=dict(color="#e2e8f0"), x=1.02,
                                 ),
-                                opacity=1.0,
-                                flatshading=True,
-                                lighting=dict(ambient=0.9, diffuse=0.3,
-                                              specular=0.0, roughness=1.0),
-                                name=f"{field_options[ft]} (Cell Mesh)",
-                                showlegend=True,
-                                hovertemplate=(
-                                    f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
-                                    "X: %{x:.2f} mm | Y: %{y:.2f} mm"
-                                    "<extra></extra>"
-                                ),
-                            ))
-                            _render_label = f"Cell Mesh ({cell_data_fb['n_cells']:,} cells)"
-                        else:
-                            # 최후 fallback — Scatter3d
-                            z_col = cae_df["z"].values if has_z_global else np.zeros(len(cae_df))
-                            fig3d.add_trace(go.Scatter3d(
-                                x=cae_df["x"], y=cae_df["y"], z=z_col,
-                                mode="markers",
-                                marker=dict(
-                                    size=7, color=cae_df[ft].values,
-                                    colorscale=colorscales[ft],
-                                    colorbar=dict(
-                                        title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
-                                        tickfont=dict(color="#e2e8f0"), x=1.02,
-                                    ),
-                                    opacity=0.85, line=dict(width=0),
-                                ),
-                                name=f"{field_options[ft]} (Point Cloud)",
-                                showlegend=True,
-                            ))
-                            _render_label = "Point Cloud"
+                                opacity=0.85,
+                                line=dict(width=0),
+                            ),
+                            customdata=np.stack([
+                                cae_df[ft].values,
+                                cae_df["rel_dist"].values,
+                                cae_df["fill_time"].values,
+                            ], axis=-1),
+                            hovertemplate=(
+                                f"<b>{field_options[ft]}: %{{customdata[0]:.2f}}</b><br>"
+                                "X: %{x:.3f} mm | Y: %{y:.3f} mm<br>"
+                                "Gate Dist: %{customdata[1]:.0%}<br>"
+                                "Fill Time: %{customdata[2]:.2f} s<extra></extra>"
+                            ),
+                            name=f"{field_options[ft]} (Point Cloud)",
+                            showlegend=True,
+                        ))
 
                         if ft == "fill_time" and len(front_df) > 0:
                             fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
@@ -1766,7 +1535,9 @@ elif current_stage == "stage1":
                                 name="🟢 Flow Front (>85%)", showlegend=True,
                             ))
 
-                    # ── 게이트 마커 공통 ──────────────────────────────────
+                        st.info("💡 STL 파일을 업로드하면 실제 형상 표면에 컨투어가 표시됩니다.")
+
+                    # 게이트 마커 공통
                     fig3d.add_trace(_gate_trace_3d(gate_z))
 
                     fig3d.update_layout(
@@ -1775,7 +1546,7 @@ elif current_stage == "stage1":
                         title=dict(
                             text=(
                                 f"{field_options[ft]} Distribution"
-                                f"  [{_render_label}]"
+                                f"{'  [Mesh3d — STL Surface]' if stl_mesh_data else '  [Point Cloud]'}"
                                 f"  |  Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"
                             ),
                             font=dict(color="#e2e8f0", size=13),
@@ -1854,7 +1625,8 @@ elif current_stage == "stage1":
             st.markdown("#### 🧊 Solid Mesh 체적 시각화 (OpenFOAM VTK 실제 결과)")
             st.markdown("""
             <div class="info-box">
-            Instead of mapping data onto an STL shell, this tab visualizes <b>OpenFOAM solid mesh data</b> directly as a Point Cloud. Upload a VTK file via <b>Data Input → Option C</b> first.
+            STL 껍데기 위에 데이터를 매핑하던 방식 대신, <b>OpenFOAM이 계산한 내부 솔리드 메쉬 데이터</b>를
+            직접 Point Cloud로 시각화합니다. 좌측 <b>Data Input → Option C</b>에서 VTK 파일을 먼저 업로드하세요.
             </div>
             """, unsafe_allow_html=True)
 
@@ -1873,7 +1645,7 @@ elif current_stage == "stage1":
                     type=["vtu", "vtm", "zip"], key="solid_shortcut_uploader",
                 )
                 if _solid_shortcut:
-                    with st.spinner("Parsing VTK..."):
+                    with st.spinner("VTK 파싱 중..."):
                         try:
                             _raw = _solid_shortcut.getvalue()
                             _ext = _solid_shortcut.name.lower().split(".")[-1]
@@ -1911,7 +1683,7 @@ elif current_stage == "stage1":
 
                     # 통계 메트릭
                     _mc = st.columns(4)
-                    _mc[0].metric("Total Points", f"{len(solid_df):,}")
+                    _mc[0].metric("총 포인트", f"{len(solid_df):,}")
                     if "pressure" in solid_df.columns:
                         _mc[1].metric("최대 압력", f"{solid_df['pressure'].max():.3f} MPa")
                     if "U_mag" in solid_df.columns:
@@ -2001,7 +1773,7 @@ elif current_stage == "stage1":
                     st.divider()
                     _csv_solid = solid_df.to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
-                        "📥 Download Solid Mesh CSV",
+                        "📥 Solid Mesh CSV 다운로드",
                         _csv_solid, "solid_mesh_results.csv", "text/csv",
                         use_container_width=True,
                     )
