@@ -1,9 +1,9 @@
 import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter
-from scipy.interpolate import griddata # 상단에 추가 필요
+from scipy.interpolate import griddata
 
-# ── 재료별 공정 기준 ──────────────────────────────────────
+# ── Process limits by material ──────────────────────────────────────
 PROCESS_LIMITS: dict = {}
 PROCESS_LIMITS.update({
     "CATAMOLD-304L": {
@@ -443,12 +443,12 @@ PROCESS_LIMITS.update({
 
 def load_cae_data(file_or_path) -> pd.DataFrame:
     """
-    CSV 컬럼 예시:
+    CSV column reference:
       x, y, pressure, temperature, fill_time, velocity_x, velocity_y
-    x,y : 그리드 좌표 (mm)
-    pressure : 압력 (MPa)
-    temperature : 온도 (°C)
-    fill_time : 충진 시간 (s)
+    x,y : grid coordinates (mm)
+    pressure : injection pressure (MPa)
+    temperature : melt temperature (°C)
+    fill_time : fill time (s)
     """
     if hasattr(file_or_path, "read"):
         df = pd.read_csv(file_or_path)
@@ -458,14 +458,14 @@ def load_cae_data(file_or_path) -> pd.DataFrame:
     required = ["x", "y", "pressure", "temperature", "fill_time"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"필수 컬럼 누락: {missing}")
+        raise ValueError(f"Missing required columns: {missing}")
 
     return df
 
 
 def analyze_cae(df: pd.DataFrame, material: str = "PC+ABS") -> dict:
     """
-    CAE 결과 전체 분석 → 결함 위험도 + 최적 조건 반환
+    Full CAE result analysis → returns defect risk scores + optimal conditions
     """
     limits = PROCESS_LIMITS.get(material, PROCESS_LIMITS["PC+ABS"])
 
@@ -473,7 +473,7 @@ def analyze_cae(df: pd.DataFrame, material: str = "PC+ABS") -> dict:
     temperature = df["temperature"].values
     fill_time = df["fill_time"].values
 
-    # ── 기본 통계 ──────────────────────────────────
+    # ── Basic statistics ──────────────────────────────────
     stats = {
         "max_pressure_MPa": float(pressure.max()),
         "avg_pressure_MPa": float(pressure.mean()),
@@ -483,13 +483,13 @@ def analyze_cae(df: pd.DataFrame, material: str = "PC+ABS") -> dict:
         "pressure_gradient": float(_calc_gradient(df)),
     }
 
-    # ── 결함 위험 점수 계산 ────────────────────────
+    # ── Defect risk scoring ────────────────────────
     defect_risks = _score_defect_risks(df, limits, stats)
 
-    # ── 최적 조건 도출 ─────────────────────────────
+    # ── Derive optimal conditions ─────────────────────────────
     optimal = _derive_optimal_conditions(stats, limits, defect_risks)
 
-    # ── 그리드 맵 생성 (시각화용) ──────────────────
+    # ── Build grid maps (for visualization) ──────────────────
     grid_maps = _build_grid_maps(df)
 
     return {
@@ -502,7 +502,7 @@ def analyze_cae(df: pd.DataFrame, material: str = "PC+ABS") -> dict:
 
 
 def _calc_gradient(df: pd.DataFrame) -> float:
-    """압력 기울기 추정 (gate → end of fill)"""
+    """Estimate pressure gradient (gate → end of fill)"""
     if "x" not in df.columns:
         return 0.0
     sorted_df = df.sort_values("x")
@@ -515,93 +515,93 @@ def _calc_gradient(df: pd.DataFrame) -> float:
 
 def _score_defect_risks(df, limits, stats) -> dict:
     """
-    각 결함 위험도를 0~1 스코어로 변환
-    0 = 안전 / 1 = 매우 위험
+    Convert each defect risk to a 0~1 score
+    0 = safe / 1 = very dangerous
     """
     risks = {}
 
-    # Short shot 위험 (압력 부족)
+    # Short shot risk (insufficient pressure)
     p_max = stats["max_pressure_MPa"]
     p_limit = limits["max_pressure"]
     if p_max < p_limit * 0.4:
         risks["short_shot"] = {"score": 0.8, "level": "HIGH",
-                               "detail": f"최대 압력 {p_max:.0f} MPa — 충진 부족 가능"}
+                               "detail": f"Max pressure {p_max:.0f} MPa — possible short fill"}
     elif p_max < p_limit * 0.6:
         risks["short_shot"] = {"score": 0.4, "level": "MED",
-                               "detail": f"충진 경계 — 사출속도 증가 검토"}
+                               "detail": "Fill borderline — consider increasing injection speed"}
     else:
-        risks["short_shot"] = {"score": 0.1, "level": "LOW", "detail": "정상"}
+        risks["short_shot"] = {"score": 0.1, "level": "LOW", "detail": "Normal"}
 
-    # Weld line 위험 (충진 끝단 온도 저하 추정)
+    # Weld line risk (estimated temperature drop at fill end)
     temp_std = float(df["temperature"].std())
     if temp_std > 20:
         risks["weld_line"] = {"score": 0.7, "level": "HIGH",
-                              "detail": f"온도 편차 {temp_std:.1f}°C — Weld line 발생 예상"}
+                              "detail": f"Temperature deviation {temp_std:.1f}°C — Weld line expected"}
     elif temp_std > 10:
         risks["weld_line"] = {"score": 0.4, "level": "MED",
-                              "detail": "온도 편차 주의 — 게이트 위치 재검토"}
+                              "detail": "Temperature deviation caution — review gate location"}
     else:
-        risks["weld_line"] = {"score": 0.1, "level": "LOW", "detail": "정상"}
+        risks["weld_line"] = {"score": 0.1, "level": "LOW", "detail": "Normal"}
 
-    # Sink mark 위험 (고압 + 두꺼운 단면 추정)
+    # Sink mark risk (estimated from low pressure + thick cross-section)
     p_avg = stats["avg_pressure_MPa"]
     if p_avg < p_limit * 0.3:
         risks["sink_mark"] = {"score": 0.6, "level": "HIGH",
-                              "detail": "보압 부족 가능 — Sink 위험"}
+                              "detail": "Possible insufficient packing pressure — sink risk"}
     else:
-        risks["sink_mark"] = {"score": 0.2, "level": "LOW", "detail": "정상"}
+        risks["sink_mark"] = {"score": 0.2, "level": "LOW", "detail": "Normal"}
 
-    # Warpage 위험 (온도 불균일)
+    # Warpage risk (uneven temperature distribution)
     t_max = stats["max_temperature_C"]
     t_avg = stats["avg_temperature_C"]
     if (t_max - t_avg) > 30:
         risks["warpage"] = {"score": 0.7, "level": "HIGH",
-                            "detail": f"Hot spot {t_max:.0f}°C — 불균일 냉각으로 Warpage 위험"}
+                            "detail": f"Hot spot {t_max:.0f}°C — uneven cooling, warpage risk"}
     elif (t_max - t_avg) > 15:
         risks["warpage"] = {"score": 0.4, "level": "MED",
-                            "detail": "냉각 채널 위치 검토 권장"}
+                            "detail": "Cooling channel placement review recommended"}
     else:
-        risks["warpage"] = {"score": 0.1, "level": "LOW", "detail": "정상"}
+        risks["warpage"] = {"score": 0.1, "level": "LOW", "detail": "Normal"}
 
-    # Air trap (충진 끝단 판정 — 단순 추정)
+    # Air trap (simple estimation at fill end)
     fill_uniformity = float(df["fill_time"].std() / df["fill_time"].mean()) if df["fill_time"].mean() > 0 else 0
     if fill_uniformity > 0.4:
         risks["air_trap"] = {"score": 0.6, "level": "HIGH",
-                             "detail": "충진 불균일 — Air trap 위험 구간 존재"}
+                             "detail": "Uneven fill — air trap risk zones detected"}
     else:
-        risks["air_trap"] = {"score": 0.2, "level": "LOW", "detail": "정상"}
+        risks["air_trap"] = {"score": 0.2, "level": "LOW", "detail": "Normal"}
 
     return risks
 
 
 def _derive_optimal_conditions(stats, limits, defect_risks) -> dict:
     """
-    결함 위험 스코어 + 재료 한계 기반으로 최적 공정 조건 도출
+    Derive optimal process conditions from defect risk scores + material limits
     Rule-based weighted optimization
     """
-    # 기준: 각 파라미터를 중간값에서 시작해 위험 보정
+    # Start each parameter at midpoint and adjust based on risk scores
     melt_lo, melt_hi = limits["melt_temp"]
     mold_lo, mold_hi = limits["mold_temp"]
     spd_lo, spd_hi = limits["inj_speed"]
     pack_lo, pack_hi = limits["pack_pressure"]
     ptime_lo, ptime_hi = limits["pack_time"]
 
-    # Warpage 위험 높으면 → 금형 온도 낮추고 pack time 늘림
+    # High warpage risk → lower mold temperature, increase pack time
     warpage_score = defect_risks.get("warpage", {}).get("score", 0)
     sink_score = defect_risks.get("sink_mark", {}).get("score", 0)
     short_score = defect_risks.get("short_shot", {}).get("score", 0)
 
-    # 최적 melt temp: warpage 위험 낮추려면 낮게
+    # Optimal melt temp: lower to reduce warpage risk
     melt_opt = melt_hi - (melt_hi - melt_lo) * warpage_score * 0.5
-    mold_opt = mold_lo + (mold_hi - mold_lo) * 0.4  # 중하단
+    mold_opt = mold_lo + (mold_hi - mold_lo) * 0.4  # lower-mid range
 
-    # 사출속도: short shot 위험 있으면 올림
+    # Injection speed: raise if short shot risk detected
     spd_opt = spd_lo + (spd_hi - spd_lo) * (0.5 + short_score * 0.3)
 
-    # 보압: sink 위험 있으면 올림
+    # Packing pressure: raise if sink mark risk detected
     pack_opt = pack_lo + (pack_hi - pack_lo) * (0.5 + sink_score * 0.4)
 
-    # 보압 시간: warpage/sink 위험 시 늘림
+    # Packing time: increase if warpage/sink risk detected
     ptime_opt = ptime_lo + (ptime_hi - ptime_lo) * (0.4 + max(warpage_score, sink_score) * 0.4)
 
     return {
@@ -635,18 +635,18 @@ def _derive_optimal_conditions(stats, limits, defect_risks) -> dict:
 
 def _build_grid_maps(df: pd.DataFrame) -> dict:
     """
-    x,y 좌표 기반으로 매끄러운 2D grid 맵 생성 (보간법 적용)
+    Build smooth 2D grid maps from x,y coordinates (with interpolation)
     """
     if "x" not in df.columns or "y" not in df.columns:
         return {}
 
     try:
-        # 1. 그리드 생성 범위 설정 (실제 데이터보다 약간 여유 있게)
+        # 1. Set grid range (slightly padded beyond actual data)
         points = df[['x', 'y']].values
         x_min, x_max = df['x'].min(), df['x'].max()
         y_min, y_max = df['y'].min(), df['y'].max()
         
-        # 해상도 설정 (예: 100x100 그리드)
+        # Resolution setting (e.g. 100x100 grid)
         grid_x, grid_y = np.mgrid[x_min:x_max:100j, y_min:y_max:100j]
 
         maps = {}
@@ -656,17 +656,17 @@ def _build_grid_maps(df: pd.DataFrame) -> dict:
             
             values = df[col].values
             
-            # 2. 선형 보간(Linear Interpolation)으로 빈틈 메우기
-            # 데이터가 없는 지점(0)을 억지로 만드는 대신 주변 값을 참조해 계산합니다.
+            # 2. Fill gaps with linear interpolation
+            # Instead of forcing zeros, compute from surrounding reference points.
             grid_z = griddata(points, values, (grid_x, grid_y), method='linear')
             
-            # 3. 보간 후 끝부분의 NaN 값을 가장 가까운 값으로 채움
+            # 3. Fill NaN values at edges after interpolation using ffill/bfill
             grid_z = pd.DataFrame(grid_z).ffill().bfill().values
             
-            # 4. 시각화를 위해 다시 부드럽게 스무딩
+            # 4. Apply Gaussian smoothing for visualization
             grid_z = gaussian_filter(grid_z.astype(float), sigma=1.0)
             
-            # Plotly Heatmap은 [y, x] 구조를 기대하므로 T(전치) 처리
+            # Plotly Heatmap expects [y, x] structure — apply transpose (.T)
             maps[col] = {
                 "z": grid_z.T.tolist(), 
                 "x": np.linspace(x_min, x_max, 100).tolist(),
@@ -680,36 +680,36 @@ def _build_grid_maps(df: pd.DataFrame) -> dict:
 
 def generate_sample_cae_csv(n_points: int = 200, material: str = "PC+ABS") -> pd.DataFrame:
     """
-    실제 CAE 없을 때 사용할 샘플 데이터 생성
-    물리적으로 그럴듯한 pressure/temperature 분포 시뮬레이션
+    Generate sample data for use when no actual CAE results are available
+    Physically plausible pressure/temperature distribution simulation
     """
     np.random.seed(42)
     limits = PROCESS_LIMITS.get(material, PROCESS_LIMITS["PC+ABS"])
 
-    # 그리드 좌표 (100mm x 60mm 부품 가정)
+    # Grid coordinates (assuming 100mm x 60mm part)
     x = np.random.uniform(0, 100, n_points)
     y = np.random.uniform(0, 60, n_points)
 
-    # Gate at (0, 30) 가정
+    # Gate assumed at (0, 30)
     gate_x, gate_y = 0, 30
     dist_from_gate = np.sqrt((x - gate_x) ** 2 + (y - gate_y) ** 2)
     max_dist = dist_from_gate.max()
 
-    # Pressure: gate에서 멀수록 낮아짐 + 노이즈
+    # Pressure: decreases with distance from gate + noise
     p_max = limits["max_pressure"] * 0.85
     pressure = p_max * (1 - dist_from_gate / max_dist * 0.75) + np.random.normal(0, 3, n_points)
     pressure = np.clip(pressure, 5, limits["max_pressure"])
 
-    # Temperature: gate 근처 높고, 끝단 낮음 + hot spot
+    # Temperature: high near gate, lower at fill end + hot spot
     t_lo, t_hi = limits["melt_temp"]
     base_temp = (t_lo + t_hi) / 2
     temperature = base_temp - dist_from_gate / max_dist * 25 + np.random.normal(0, 5, n_points)
-    # Hot spot 추가 (좌상단)
+    # Add hot spot (upper-right region)
     hot_mask = (x > 70) & (y > 45)
     temperature[hot_mask] += 15
     temperature = np.clip(temperature, limits["mold_temp"][0] + 20, t_hi + 10)
 
-    # Fill time: 거리 비례 + 두께 변동
+    # Fill time: proportional to distance + thickness variation
     fill_time = dist_from_gate / max_dist * 1.8 + np.random.normal(0, 0.05, n_points)
     fill_time = np.clip(fill_time, 0.01, 2.5)
 
@@ -722,7 +722,7 @@ def generate_sample_cae_csv(n_points: int = 200, material: str = "PC+ABS") -> pd
     })
 
     return df
-# MIM 재료 추가
+# MIM materials
 PROCESS_LIMITS.update({
     "17-4PH": {
         "melt_temp": (175, 200),
